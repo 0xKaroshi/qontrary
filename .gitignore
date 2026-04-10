@@ -3,3 +3,4 @@ dist/
 .env
 qontrary-output/
 *.log
+.DS_Store
