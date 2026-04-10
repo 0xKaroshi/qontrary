@@ -305,4 +305,66 @@ describe("runContrarianAgent", () => {
 
     expect(typeof claudeContent).toBe("string");
   });
+
+  it("falls back to Kimi when Gemini fails after retries", { timeout: 15_000 }, async () => {
+    const failingGemini: GeminiLike = {
+      models: {
+        generateContent: async () => {
+          throw new Error("503 Service Unavailable");
+        },
+      },
+    };
+
+    const kimiClient = gptMock(approve, { p: 200, c: 200 });
+
+    const out = await runContrarianAgent(baseInput, {
+      claude: claudeMock(approve),
+      gpt: gptMock(approve),
+      gemini: failingGemini,
+      kimi: kimiClient,
+    });
+
+    expect(out.verdict).toBe("APPROVE");
+    // Should have 3 successful verdicts (claude, gpt, kimi)
+    expect(out.model_verdicts.kimi).toBeDefined();
+    expect(out.model_verdicts.kimi!.model).toBe("kimi");
+    expect(out.model_verdicts.kimi!.verdict).toBe("approve");
+    // Gemini should be undefined since it failed and kimi took over
+    expect(out.model_verdicts.gemini).toBeUndefined();
+    // No reviewer failures — kimi succeeded as fallback
+    expect(out.reviewer_failures).toBeUndefined();
+  });
+
+  it("degrades when both Gemini and Kimi fail", { timeout: 20_000 }, async () => {
+    const failingGemini: GeminiLike = {
+      models: {
+        generateContent: async () => {
+          throw new Error("503 Service Unavailable");
+        },
+      },
+    };
+
+    const failingKimi: GPTLike = {
+      chat: {
+        completions: {
+          create: async () => {
+            throw new Error("Kimi API error");
+          },
+        },
+      },
+    };
+
+    const out = await runContrarianAgent(baseInput, {
+      claude: claudeMock(approve),
+      gpt: gptMock(approve),
+      gemini: failingGemini,
+      kimi: failingKimi,
+    });
+
+    // Should still work in degraded mode with claude + gpt
+    expect(out.verdict).toBe("APPROVE");
+    expect(out.reviewer_failures).toBeDefined();
+    expect(out.reviewer_failures!.length).toBe(1);
+    expect(out.reviewer_failures![0]!.name).toBe("gemini/kimi");
+  });
 });

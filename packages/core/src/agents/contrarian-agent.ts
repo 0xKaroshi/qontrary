@@ -32,7 +32,7 @@ export interface Issue {
   description: string;
   affected_files: string[];
   suggested_fix: string;
-  reported_by: ("claude" | "gpt" | "gemini")[];
+  reported_by: ("claude" | "gpt" | "gemini" | "kimi")[];
 }
 
 /** Per-model verdict. */
@@ -52,7 +52,7 @@ export interface ContrarianOutput {
   verdict: "APPROVE" | "REJECT" | "ESCALATE";
   round: number;
   issues: Issue[];
-  model_verdicts: { claude?: ModelVerdict; gpt?: ModelVerdict; gemini?: ModelVerdict };
+  model_verdicts: { claude?: ModelVerdict; gpt?: ModelVerdict; gemini?: ModelVerdict; kimi?: ModelVerdict };
   reviewer_failures?: { name: string; error: string }[];
   consensus_score: number;
   blind_test_results: { test_id: string; passed: boolean; model_that_evaluated: string }[];
@@ -82,12 +82,16 @@ export class ContrarianAgentError extends Error {
 
 const MAX_ROUND = 3;
 
+/** Reviewer model name type. */
+type ReviewerName = "claude" | "gpt" | "gemini" | "kimi";
+
 // Pricing approximations (USD / token).
-const PRICING = {
+const PRICING: Record<ReviewerName, { input: number; output: number }> = {
   claude: { input: 3 / 1_000_000, output: 15 / 1_000_000 },
   gpt: { input: 2.5 / 1_000_000, output: 10 / 1_000_000 },
   gemini: { input: 1.25 / 1_000_000, output: 5 / 1_000_000 },
-} as const;
+  kimi: { input: 2 / 1_000_000, output: 8 / 1_000_000 },
+};
 
 /** Reviewer focus areas. */
 const FOCUS = {
@@ -155,7 +159,7 @@ function buildUserPrompt(input: ContrarianInput): string {
 }
 
 /** Validate one Issue from a model response. */
-function validateIssue(raw: unknown, reportedBy: "claude" | "gpt" | "gemini"): Issue | null {
+function validateIssue(raw: unknown, reportedBy: ReviewerName): Issue | null {
   if (typeof raw !== "object" || raw === null) return null;
   const r = raw as Record<string, unknown>;
   if (
@@ -183,7 +187,7 @@ function validateIssue(raw: unknown, reportedBy: "claude" | "gpt" | "gemini"): I
 /** Parse a model's JSON response into a ModelVerdict. */
 function parseModelResponse(
   text: string,
-  modelName: "claude" | "gpt" | "gemini",
+  modelName: ReviewerName,
   tokensUsed: number,
   costUsd: number,
 ): ModelVerdict {
@@ -381,6 +385,29 @@ async function callGemini(
   return parseModelResponse(resp.text ?? "", "gemini", tokens, cost);
 }
 
+/**
+ * Call Kimi K2.5 via the OpenAI-compatible API (Moonshot).
+ * Used as a fallback when Gemini is unavailable.
+ */
+async function callKimi(
+  client: GPTLike,
+  systemMsg: string,
+  userMsg: string,
+): Promise<ModelVerdict> {
+  const resp = await client.chat.completions.create({
+    model: "kimi-k2.5",
+    messages: [
+      { role: "system", content: systemMsg },
+      { role: "user", content: userMsg },
+    ],
+  });
+  const text = resp.choices[0]?.message.content ?? "";
+  const usage = resp.usage ?? { prompt_tokens: 0, completion_tokens: 0 };
+  const tokens = usage.prompt_tokens + usage.completion_tokens;
+  const cost = usage.prompt_tokens * PRICING.kimi.input + usage.completion_tokens * PRICING.kimi.output;
+  return parseModelResponse(text, "kimi", tokens, cost);
+}
+
 /** Merge issues across reviewers, deduping by category+description. */
 function mergeIssues(verdicts: ModelVerdict[]): Issue[] {
   const map = new Map<string, Issue>();
@@ -421,6 +448,8 @@ export interface RunContrarianAgentOptions {
   claude?: ClaudeLike;
   gpt?: GPTLike;
   gemini?: GeminiLike;
+  /** Kimi K2.5 client (OpenAI-compatible); used as fallback when Gemini 503s. */
+  kimi?: GPTLike;
   breaker?: CircuitBreaker;
 }
 
@@ -446,21 +475,46 @@ export async function runContrarianAgent(
     const gemini: GeminiLike =
       opts.gemini ??
       (new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY ?? "" }) as unknown as GeminiLike);
+    const kimiClient: GPTLike | undefined =
+      opts.kimi ??
+      (process.env.KIMI_API_KEY
+        ? (new OpenAI({
+            apiKey: process.env.KIMI_API_KEY,
+            baseURL: "https://api.moonshot.ai/v1",
+          }) as unknown as GPTLike)
+        : undefined);
 
     const userMsg = buildUserPrompt(input);
     const screenshot = input.screenshot;
 
-    // Screenshot note appended to Gemini text prompt (no native vision array format needed)
-    const geminiUserMsg = screenshot
+    // Screenshot note appended to Gemini/Kimi text prompt (no native vision array format needed)
+    const thirdReviewerMsg = screenshot
       ? `${userMsg}\n\n[A screenshot of the running UI was provided to Claude and GPT reviewers for visual inspection. Flag any VISUAL_MISMATCH issues you find from the code alone.]`
       : userMsg;
+
+    /**
+     * Third reviewer: try Gemini first, fall back to Kimi K2.5 if Gemini fails.
+     */
+    async function callThirdReviewer(): Promise<ModelVerdict> {
+      try {
+        return await withRetry("gemini", () =>
+          callGemini(gemini, SYSTEM_PROMPT(FOCUS.gemini), thirdReviewerMsg),
+        );
+      } catch (geminiErr) {
+        if (!kimiClient) throw geminiErr;
+        console.log(`[contrarian] gemini failed after retries, falling back to kimi-k2.5`);
+        return await withRetry("kimi", () =>
+          callKimi(kimiClient, SYSTEM_PROMPT(FOCUS.gemini), thirdReviewerMsg),
+        );
+      }
+    }
 
     const settled = await Promise.allSettled([
       withRetry("claude", () => callClaude(claude, SYSTEM_PROMPT(FOCUS.claude), userMsg, screenshot)),
       withRetry("gpt", () => callGPT(gpt, SYSTEM_PROMPT(FOCUS.gpt), userMsg, screenshot)),
-      withRetry("gemini", () => callGemini(gemini, SYSTEM_PROMPT(FOCUS.gemini), geminiUserMsg)),
+      callThirdReviewer(),
     ]);
-    const reviewerNames = ["claude", "gpt", "gemini"] as const;
+    const reviewerNames = ["claude", "gpt", "gemini/kimi"] as const;
     const failures: { name: string; error: string }[] = [];
     const ok: ModelVerdict[] = [];
     settled.forEach((s, i) => {
@@ -478,6 +532,7 @@ export async function runContrarianAgent(
     const claudeV = ok.find((v) => v.model === "claude");
     const gptV = ok.find((v) => v.model === "gpt");
     const geminiV = ok.find((v) => v.model === "gemini");
+    const kimiV = ok.find((v) => v.model === "kimi");
 
     // Charge total cost to the breaker.
     const totalCost = ok.reduce((s, v) => s + v.cost_usd, 0);
@@ -511,7 +566,7 @@ export async function runContrarianAgent(
       verdict,
       round: input.round,
       issues,
-      model_verdicts: { claude: claudeV, gpt: gptV, gemini: geminiV },
+      model_verdicts: { claude: claudeV, gpt: gptV, gemini: geminiV, kimi: kimiV },
       reviewer_failures: failures.length > 0 ? failures : undefined,
       consensus_score: consensusScore(verdicts),
       blind_test_results: [...blindMap.values()],

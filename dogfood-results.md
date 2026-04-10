@@ -742,3 +742,70 @@ Warm pools deliver **28% cost reduction** and **33% fewer tokens** for the same 
 | ✅ Truly APPROVED | 10 | $4.49 |
 | ⚠️ False-positive (run #3, fixed) | 1 | $0.47 |
 | ❌ FAILED | 13 | $4.63 |
+
+---
+
+## Run #25 — Express Health API (with Kimi K2.5 Fallback)
+**Task:** `qontrary "Build an Express API with one endpoint: GET /health returns { status: ok, timestamp }"`
+**Build ID:** `build_1775817452614_g63lwv`
+
+### What we added before this run
+- **Kimi K2.5 as Gemini fallback**: When Gemini 503s after 3 retries, automatically swaps to Kimi K2.5 via the OpenAI SDK (`baseURL: https://api.moonshot.ai/v1`, model `kimi-k2.5`)
+- Added `KIMI_API_KEY` to `.env.example`
+- Updated `ReviewerName` type, `PRICING`, `model_verdicts`, and `reported_by` to include `"kimi"`
+- `callThirdReviewer()` wrapper: tries Gemini → on failure → tries Kimi
+- If both Gemini and Kimi fail, degrades to 2/3 mode as before
+
+### Pipeline
+| Stage | Result | Notes |
+|---|---|---|
+| Spec | `Express Health Check API` | Clean |
+| Plan | 3 tasks | Same lean plan as run #24 |
+| Build | **success** — 3 files | Template `node-express`, 1 extra dep |
+| Contrarian | **APPROVE** (round 1) | **3/3 reviewers** — Claude, GPT, Kimi |
+
+### Kimi fallback in action
+```
+[contrarian] gemini attempt 1 failed: ApiError: 503
+[contrarian] gemini attempt 2 failed: ApiError: 503
+[contrarian] gemini attempt 3 failed: ApiError: 503
+[contrarian] gemini failed after retries, falling back to kimi-k2.5
+[CONTRARIAN] review: APPROVE
+```
+
+### Reviewer verdicts
+| Model | Verdict | Confidence | Cost | Tokens |
+|---|---|---|---|---|
+| Claude | approve | 98 | $0.0119 | 2849 |
+| GPT-4o | approve | 0.95 | $0.0070 | 2343 |
+| Kimi K2.5 | approve | 1.0 | $0.0193 | 4052 |
+
+### Comparison vs Run #24 (same task, degraded 2/3 mode)
+| Metric | Run #24 (degraded) | Run #25 (Kimi fallback) | Notes |
+|---|---|---|---|
+| Reviewers | 2/3 | **3/3** | First full consensus since Gemini started 503ing |
+| Review cost | $0.0172 | **$0.0382** | Higher (3 reviewers + Kimi retry overhead) |
+| Total cost | $0.051 | **$0.076** | +49% — cost of full consensus |
+| Time | 105.2s | **138.6s** | +32s (Gemini retry delay + Kimi latency) |
+| Failures | 1 (gemini) | **0** | No degraded mode |
+
+### Cost & time
+| Metric | Value |
+|---|---|
+| Build cost | $0.0375 |
+| Review cost | $0.0382 |
+| Total | **$0.0756** |
+| Time | 138.6s |
+
+### Verdict: ✅ APPROVED
+
+### Takeaway
+Kimi K2.5 works as a drop-in Gemini replacement via the OpenAI-compatible API. The tradeoff is clear: **full 3-model consensus costs ~$0.025 more and 33s longer** than degraded 2/3 mode, because of the Gemini retry delay (7s × 3) plus Kimi's response time. Kimi's confidence=1.0 and 4052 tokens suggest it's a thorough reviewer. The real value is eliminating the "degraded mode" warning — every build now gets a genuine third opinion instead of a footnote about Gemini being down.
+
+### Running totals
+| Bucket | Count | Total |
+|---|---|---|
+| Total builds | 25 | **$9.67** |
+| ✅ Truly APPROVED | 11 | $4.57 |
+| ⚠️ False-positive (run #3, fixed) | 1 | $0.47 |
+| ❌ FAILED | 13 | $4.63 |
