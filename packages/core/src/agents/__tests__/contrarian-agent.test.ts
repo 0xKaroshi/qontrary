@@ -126,6 +126,22 @@ const rejectStyle: ModelResp = {
   ],
 };
 
+const rejectVisual: ModelResp = {
+  verdict: "reject",
+  confidence: 0.85,
+  reasoning: "The screenshot shows a blank page",
+  issues: [
+    {
+      severity: "critical",
+      category: "VISUAL_MISMATCH",
+      description: "Screenshot shows a blank white page instead of a sortable table",
+      affected_files: ["src/App.tsx"],
+      suggested_fix: "Fix React rendering — component does not mount",
+    },
+  ],
+  blind_test_results: [{ test_id: "bt1", passed: false }],
+};
+
 describe("runContrarianAgent", () => {
   it("all 3 approve → APPROVE", async () => {
     const out = await runContrarianAgent(baseInput, {
@@ -200,5 +216,93 @@ describe("runContrarianAgent", () => {
     expect(out.model_verdicts.claude!.cost_usd).toBeGreaterThan(0);
     expect(out.model_verdicts.gpt!.cost_usd).toBeGreaterThan(0);
     expect(out.model_verdicts.gemini!.cost_usd).toBeGreaterThan(0);
+  });
+
+  it("VISUAL_MISMATCH is accepted as a valid rejection category", async () => {
+    const out = await runContrarianAgent(baseInput, {
+      claude: claudeMock(rejectVisual),
+      gpt: gptMock(rejectVisual),
+      gemini: geminiMock(approve),
+    });
+    expect(out.verdict).toBe("REJECT");
+    expect(out.issues.length).toBe(1);
+    expect(out.issues[0]!.category).toBe("VISUAL_MISMATCH");
+    expect(out.issues[0]!.reported_by).toContain("claude");
+    expect(out.issues[0]!.reported_by).toContain("gpt");
+  });
+
+  it("passes screenshot to Claude and GPT when provided", async () => {
+    const fakeScreenshot = "iVBORw0KGgoAAAANSUhEUg==";
+    let claudeContent: unknown = null;
+    let gptContent: unknown = null;
+
+    const claudeWithCapture: ClaudeLike = {
+      messages: {
+        create: async (args) => {
+          claudeContent = args.messages[0]?.content;
+          return {
+            content: [{ type: "text", text: JSON.stringify(approve) }],
+            usage: { input_tokens: 100, output_tokens: 100 },
+          };
+        },
+      },
+    };
+
+    const gptWithCapture: GPTLike = {
+      chat: {
+        completions: {
+          create: async (args) => {
+            gptContent = args.messages.find((m) => m.role === "user")?.content;
+            return {
+              choices: [{ message: { content: JSON.stringify(approve) } }],
+              usage: { prompt_tokens: 100, completion_tokens: 100 },
+            };
+          },
+        },
+      },
+    };
+
+    await runContrarianAgent(
+      { ...baseInput, screenshot: fakeScreenshot },
+      {
+        claude: claudeWithCapture,
+        gpt: gptWithCapture,
+        gemini: geminiMock(approve),
+      },
+    );
+
+    // Claude should receive an array with image content block
+    expect(Array.isArray(claudeContent)).toBe(true);
+    const claudeArr = claudeContent as { type: string }[];
+    expect(claudeArr.some((b) => b.type === "image")).toBe(true);
+
+    // GPT should receive an array with image_url content part
+    expect(Array.isArray(gptContent)).toBe(true);
+    const gptArr = gptContent as { type: string }[];
+    expect(gptArr.some((b) => b.type === "image_url")).toBe(true);
+  });
+
+  it("without screenshot, Claude and GPT receive plain string content", async () => {
+    let claudeContent: unknown = null;
+
+    const claudeWithCapture: ClaudeLike = {
+      messages: {
+        create: async (args) => {
+          claudeContent = args.messages[0]?.content;
+          return {
+            content: [{ type: "text", text: JSON.stringify(approve) }],
+            usage: { input_tokens: 100, output_tokens: 100 },
+          };
+        },
+      },
+    };
+
+    await runContrarianAgent(baseInput, {
+      claude: claudeWithCapture,
+      gpt: gptMock(approve),
+      gemini: geminiMock(approve),
+    });
+
+    expect(typeof claudeContent).toBe("string");
   });
 });

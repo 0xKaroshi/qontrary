@@ -193,6 +193,7 @@ export class Orchestrator extends EventEmitter {
             build: build!,
             blind_tests: spec!.blind_tests,
             round,
+            screenshot: build!.screenshot,
           }),
         );
         this.addCost(review.total_cost_usd);

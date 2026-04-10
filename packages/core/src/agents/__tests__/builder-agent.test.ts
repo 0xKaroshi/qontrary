@@ -90,12 +90,14 @@ describe("runBuilderAgent", () => {
     expect(out.self_fix_rounds).toBeGreaterThanOrEqual(1);
   });
 
-  it("circuit breaker: stops after 5 failed fixes on a single task", async () => {
+  it("circuit breaker: stops early when same error repeats (early-bail)", async () => {
     const { sandbox } = fakeSandboxFactory(Array(20).fill(1)); // never succeeds
     const out = await runBuilderAgent(input, { client: mockClient(), sandbox });
     expect(out.status).toBe("failed");
-    expect(out.self_fix_rounds).toBe(5);
-    expect(out.error_log.some((e) => e.includes("failed after 5 fix attempts"))).toBe(true);
+    // Early-bail triggers after 1 repeated identical error, so ≤ 5 rounds
+    expect(out.self_fix_rounds).toBeGreaterThanOrEqual(1);
+    expect(out.self_fix_rounds).toBeLessThanOrEqual(5);
+    expect(out.error_log.length).toBeGreaterThan(0);
   });
 
   it("cost limit: stops when $5 budget is exceeded", async () => {

@@ -13,7 +13,8 @@ export type IssueCategory =
   | "EXECUTION_FAILURE"
   | "DIVERGENCE"
   | "SECURITY"
-  | "BLIND_TEST_FAIL";
+  | "BLIND_TEST_FAIL"
+  | "VISUAL_MISMATCH";
 
 const ALLOWED_CATEGORIES: IssueCategory[] = [
   "SPEC_VIOLATION",
@@ -21,6 +22,7 @@ const ALLOWED_CATEGORIES: IssueCategory[] = [
   "DIVERGENCE",
   "SECURITY",
   "BLIND_TEST_FAIL",
+  "VISUAL_MISMATCH",
 ];
 
 /** Single reviewer issue. */
@@ -67,6 +69,8 @@ export interface ContrarianInput {
   round: number;
   /** Optional diff vs prior round; if absent, the entire build is reviewed. */
   diff?: string;
+  /** Optional base64-encoded PNG screenshot of the running UI. */
+  screenshot?: string;
 }
 
 export class ContrarianAgentError extends Error {
@@ -101,6 +105,7 @@ Your job is to find REAL problems. You may ONLY reject for these categories:
 - DIVERGENCE: files or dependencies exist that were not in the plan
 - SECURITY: exposed keys, SQL injection, obvious vulnerabilities
 - BLIND_TEST_FAIL: code fails a blind test assertion
+- VISUAL_MISMATCH: the screenshot shows the UI does not match what was specified (broken layout, missing components, rendering errors, blank page)
 
 You MUST NOT reject for: style preferences, naming, alternative approaches, or missing features that are not in the spec.
 
@@ -113,7 +118,7 @@ Respond with ONLY a single JSON object — no prose, no markdown fences:
   "reasoning": string,
   "issues": {
     "severity": "critical"|"major"|"minor",
-    "category": "SPEC_VIOLATION"|"EXECUTION_FAILURE"|"DIVERGENCE"|"SECURITY"|"BLIND_TEST_FAIL",
+    "category": "SPEC_VIOLATION"|"EXECUTION_FAILURE"|"DIVERGENCE"|"SECURITY"|"BLIND_TEST_FAIL"|"VISUAL_MISMATCH",
     "description": string,
     "affected_files": string[],
     "suggested_fix": string
@@ -226,13 +231,18 @@ function parseModelResponse(
 
 // ───────────────────── Model client interfaces ─────────────────────
 
+/** Content block for Claude multimodal messages. */
+export type ClaudeContentBlock =
+  | { type: "text"; text: string }
+  | { type: "image"; source: { type: "base64"; media_type: "image/png"; data: string } };
+
 export interface ClaudeLike {
   messages: {
     create: (args: {
       model: string;
       max_tokens: number;
       system: string;
-      messages: { role: "user"; content: string }[];
+      messages: { role: "user"; content: string | ClaudeContentBlock[] }[];
     }) => Promise<{
       content: { type: string; text?: string }[];
       usage?: { input_tokens: number; output_tokens: number };
@@ -240,12 +250,17 @@ export interface ClaudeLike {
   };
 }
 
+/** Content part for GPT multimodal messages. */
+export type GPTContentPart =
+  | { type: "text"; text: string }
+  | { type: "image_url"; image_url: { url: string } };
+
 export interface GPTLike {
   chat: {
     completions: {
       create: (args: {
         model: string;
-        messages: { role: "system" | "user"; content: string }[];
+        messages: { role: "system" | "user"; content: string | GPTContentPart[] }[];
       }) => Promise<{
         choices: { message: { content: string | null } }[];
         usage?: { prompt_tokens: number; completion_tokens: number };
@@ -289,12 +304,27 @@ async function callClaude(
   client: ClaudeLike,
   systemMsg: string,
   userMsg: string,
+  screenshot?: string,
 ): Promise<ModelVerdict> {
+  let content: string | ClaudeContentBlock[] = userMsg;
+  if (screenshot) {
+    content = [
+      { type: "text", text: userMsg },
+      {
+        type: "image",
+        source: { type: "base64", media_type: "image/png", data: screenshot },
+      },
+      {
+        type: "text",
+        text: "Above is a screenshot of the running UI. Check for VISUAL_MISMATCH issues: broken layout, missing components, rendering errors, or blank pages.",
+      },
+    ];
+  }
   const resp = await client.messages.create({
     model: "claude-sonnet-4-6",
     max_tokens: 4096,
     system: systemMsg,
-    messages: [{ role: "user", content: userMsg }],
+    messages: [{ role: "user", content }],
   });
   const block = resp.content.find((c) => c.type === "text");
   const text = block && typeof block.text === "string" ? block.text : "";
@@ -304,12 +334,28 @@ async function callClaude(
   return parseModelResponse(text, "claude", tokens, cost);
 }
 
-async function callGPT(client: GPTLike, systemMsg: string, userMsg: string): Promise<ModelVerdict> {
+async function callGPT(
+  client: GPTLike,
+  systemMsg: string,
+  userMsg: string,
+  screenshot?: string,
+): Promise<ModelVerdict> {
+  let content: string | GPTContentPart[] = userMsg;
+  if (screenshot) {
+    content = [
+      { type: "text", text: userMsg },
+      { type: "image_url", image_url: { url: `data:image/png;base64,${screenshot}` } },
+      {
+        type: "text",
+        text: "Above is a screenshot of the running UI. Check for VISUAL_MISMATCH issues: broken layout, missing components, rendering errors, or blank pages.",
+      },
+    ];
+  }
   const resp = await client.chat.completions.create({
     model: "gpt-4o",
     messages: [
       { role: "system", content: systemMsg },
-      { role: "user", content: userMsg },
+      { role: "user", content },
     ],
   });
   const text = resp.choices[0]?.message.content ?? "";
@@ -402,11 +448,17 @@ export async function runContrarianAgent(
       (new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY ?? "" }) as unknown as GeminiLike);
 
     const userMsg = buildUserPrompt(input);
+    const screenshot = input.screenshot;
+
+    // Screenshot note appended to Gemini text prompt (no native vision array format needed)
+    const geminiUserMsg = screenshot
+      ? `${userMsg}\n\n[A screenshot of the running UI was provided to Claude and GPT reviewers for visual inspection. Flag any VISUAL_MISMATCH issues you find from the code alone.]`
+      : userMsg;
 
     const settled = await Promise.allSettled([
-      withRetry("claude", () => callClaude(claude, SYSTEM_PROMPT(FOCUS.claude), userMsg)),
-      withRetry("gpt", () => callGPT(gpt, SYSTEM_PROMPT(FOCUS.gpt), userMsg)),
-      withRetry("gemini", () => callGemini(gemini, SYSTEM_PROMPT(FOCUS.gemini), userMsg)),
+      withRetry("claude", () => callClaude(claude, SYSTEM_PROMPT(FOCUS.claude), userMsg, screenshot)),
+      withRetry("gpt", () => callGPT(gpt, SYSTEM_PROMPT(FOCUS.gpt), userMsg, screenshot)),
+      withRetry("gemini", () => callGemini(gemini, SYSTEM_PROMPT(FOCUS.gemini), geminiUserMsg)),
     ]);
     const reviewerNames = ["claude", "gpt", "gemini"] as const;
     const failures: { name: string; error: string }[] = [];

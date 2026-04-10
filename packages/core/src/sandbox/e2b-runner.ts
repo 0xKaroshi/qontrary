@@ -1,4 +1,5 @@
 import { Sandbox } from "@e2b/code-interpreter";
+import { TEMPLATES, type SandboxTemplate } from "./templates.js";
 
 /** Result from running a shell command in a sandbox. */
 export interface CommandResult {
@@ -12,6 +13,16 @@ export interface DirEntry {
   name: string;
   path: string;
   type: "file" | "dir";
+}
+
+/** Result from taking a screenshot in a sandbox. */
+export interface ScreenshotResult {
+  /** Base64-encoded PNG data. */
+  base64Png: string;
+  /** URL that was screenshotted. */
+  url: string;
+  /** Viewport dimensions used. */
+  viewport: { width: number; height: number };
 }
 
 /**
@@ -83,6 +94,55 @@ export class E2BSandbox {
   }
 
   /**
+   * Create a sandbox pre-provisioned with a stack template.
+   * If the template's marker file already exists (e.g. re-used sandbox), the
+   * install step is skipped.
+   * @param templateName key from TEMPLATES (e.g. "node-express", "react")
+   * @returns sandbox id
+   */
+  async createWarmSandbox(templateName: string): Promise<string> {
+    const tpl: SandboxTemplate | undefined = TEMPLATES[templateName];
+    if (!tpl) {
+      throw new SandboxError(`Unknown template: ${templateName}`);
+    }
+    const id = await this.createSandbox();
+    if (tpl.packages.length === 0) {
+      // Base template — nothing to install, just write marker
+      await this.writeFile(id, tpl.markerPath, `warm:${templateName}`);
+      return id;
+    }
+    try {
+      // Check if already provisioned (use this.runCommand to handle CommandExitError)
+      const check = await this.runCommand(id, `test -f ${tpl.markerPath} && echo warm`);
+      if (check.stdout.trim() === "warm") {
+        console.log(`[e2b] sandbox ${id} already warm for ${templateName}`);
+        return id;
+      }
+
+      // Install template packages
+      const installCmd = `npm install ${tpl.packages.join(" ")} 2>&1`;
+      console.log(`[e2b] warming sandbox ${id} with template ${templateName}`);
+      const installRes = await this.runCommand(id, installCmd);
+      if (installRes.exitCode !== 0) {
+        console.log(`[e2b] warm install warning (non-fatal): exit ${installRes.exitCode}`);
+      }
+
+      // Run post-install if defined
+      if (tpl.postInstall) {
+        await this.runCommand(id, tpl.postInstall);
+      }
+
+      // Write marker
+      await this.writeFile(id, tpl.markerPath, `warm:${templateName}`);
+      console.log(`[e2b] sandbox ${id} warmed for ${templateName}`);
+    } catch (err) {
+      // Non-fatal — sandbox still usable, just not warm
+      console.log(`[e2b] warm setup failed (non-fatal): ${String(err).slice(0, 120)}`);
+    }
+    return id;
+  }
+
+  /**
    * Resolve a sandbox by id, enforcing the total lifetime budget.
    * @param id sandbox id
    */
@@ -149,7 +209,80 @@ export class E2BSandbox {
       const res = await sandbox.commands.run(command, { timeoutMs: COMMAND_TIMEOUT_MS });
       return { stdout: res.stdout, stderr: res.stderr, exitCode: res.exitCode };
     } catch (err) {
-      throw err instanceof SandboxError ? err : new SandboxError(`runCommand failed: ${String(err)}`);
+      const msg = String(err);
+      const exitMatch = msg.match(/exit status (\d+)/);
+      if (exitMatch) {
+        return { stdout: "", stderr: msg, exitCode: Number(exitMatch[1]) };
+      }
+      throw err instanceof SandboxError ? err : new SandboxError(`runCommand failed: ${msg}`);
+    }
+  }
+
+  /**
+   * Take a screenshot of a URL running inside the sandbox.
+   * Installs puppeteer if needed, navigates to the URL, and returns base64 PNG.
+   * @param id sandbox id
+   * @param url URL to screenshot (typically http://localhost:PORT)
+   * @param viewport optional viewport size (default 1280x720)
+   */
+  async takeScreenshot(
+    id: string,
+    url: string,
+    viewport: { width: number; height: number } = { width: 1280, height: 720 },
+  ): Promise<ScreenshotResult> {
+    try {
+      const { sandbox } = this.getRecord(id);
+
+      // Install puppeteer (bundles Chromium)
+      await sandbox.commands.run("npm install --no-save puppeteer 2>&1 || true", {
+        timeoutMs: COMMAND_TIMEOUT_MS,
+      });
+
+      // Write a small screenshot script
+      const screenshotScript = `
+const puppeteer = require('puppeteer');
+(async () => {
+  const browser = await puppeteer.launch({
+    headless: 'new',
+    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
+  });
+  const page = await browser.newPage();
+  await page.setViewport({ width: ${viewport.width}, height: ${viewport.height} });
+  await page.goto('${url}', { waitUntil: 'networkidle0', timeout: 15000 });
+  await page.screenshot({ path: '/tmp/screenshot.png', fullPage: false });
+  await browser.close();
+  process.exit(0);
+})().catch(err => { console.error(err.message); process.exit(1); });
+`;
+      await sandbox.files.write("/tmp/take-screenshot.js", screenshotScript);
+
+      const result = await sandbox.commands.run("node /tmp/take-screenshot.js", {
+        timeoutMs: COMMAND_TIMEOUT_MS,
+      });
+
+      if (result.exitCode !== 0) {
+        throw new SandboxError(`Screenshot script failed (exit ${result.exitCode}): ${result.stderr}`);
+      }
+
+      // Read the screenshot as base64
+      const pngContent = await sandbox.commands.run(
+        "base64 -w 0 /tmp/screenshot.png 2>/dev/null || base64 /tmp/screenshot.png",
+        { timeoutMs: COMMAND_TIMEOUT_MS },
+      );
+
+      if (!pngContent.stdout || pngContent.exitCode !== 0) {
+        throw new SandboxError("Failed to read screenshot file as base64");
+      }
+
+      return {
+        base64Png: pngContent.stdout.trim(),
+        url,
+        viewport,
+      };
+    } catch (err) {
+      throw err instanceof SandboxError
+        ? err
+        : new SandboxError(`takeScreenshot failed: ${String(err)}`);
     }
   }
 

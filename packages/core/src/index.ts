@@ -6,3 +6,4 @@ export * from "./pipeline/orchestrator.js";
 export * from "./pipeline/state-machine.js";
 export * from "./pipeline/circuit-breaker.js";
 export * from "./sandbox/e2b-runner.js";
+export * from "./sandbox/templates.js";

@@ -4,6 +4,8 @@ import { E2BSandbox } from "../sandbox/e2b-runner.js";
 import type { AnthropicLike, SpecOutput } from "./spec-agent.js";
 import type { BuildTask, PlanOutput } from "./planner-agent.js";
 import { extractJson } from "../utils/extract-json.js";
+import { generateMocks, renderMockInstructions } from "../utils/mock-generator.js";
+import { matchTemplate, getPreInstalledPackages } from "../sandbox/templates.js";
 
 /** A critique passed back from the Contrarian when retrying a build. */
 export interface ContrarianRejection {
@@ -33,6 +35,8 @@ export interface BuildOutput {
   total_cost_usd: number;
   sandbox_id: string;
   error_log: string[];
+  /** Base64-encoded PNG screenshot of the running UI, if applicable. */
+  screenshot?: string;
 }
 
 /** Builder input. */
@@ -72,8 +76,14 @@ verify_command is a single shell command that exits 0 when the task is correct.
 CRITICAL rules for verify_command, by task type:
 - task type "setup" or "config": verify_command MUST be a simple file-existence check, e.g. \`test -f src/config.ts\` (or \`test -f a && test -f b\` for multiple files). DO NOT run \`tsc\`, \`node\`, \`npm\`, or any tool that depends on dependencies being installed or other files existing.
 - task type "implement": prefer a static check (\`test -f path && node --check path\` for JS, or \`test -f path\`). Only run the file if it has no external dependencies and no required env vars.
-- task type "test": this is the only task type where running a test runner (\`pytest -q\`, \`vitest run\`, \`jest --silent\`) is appropriate, and only after all impl + deps are in place.
-- If you genuinely cannot verify anything for this task, return "true".`;
+- task type "test": this is the only task type where running a test runner is appropriate. ALWAYS prefix with \`npx\` (e.g. \`npx vitest run --reporter=verbose\`, \`npx jest --forceExit\`, \`npx pytest -q\`). NEVER use bare \`jest\`, \`vitest\`, or \`pytest\` — the binary may not be on PATH.
+- If you genuinely cannot verify anything for this task, return "true".
+
+CRITICAL: All test files MUST mock external HTTP calls. Tests must NEVER make real network requests.
+Override global fetch or use jest.mock/vi.mock to intercept HTTP. If mock data is provided in the prompt, use those exact response shapes.
+Tests that require a running server (Express/WebSocket) MUST use supertest or start/stop the server in setup/teardown — never rely on a pre-running server process.
+
+Common dependencies may be pre-installed in the sandbox. Do not generate setup tasks that only run \`npm install\` for packages that are already present. If a setup task's only purpose is installing dependencies, use a simple file-existence check as verify_command.`;
 
 /** Per-task code-gen response from the model. */
 interface TaskCodeGen {
@@ -163,9 +173,39 @@ async function callModelForTask(
   try {
     parsed = extractJson(text);
   } catch (e) {
-    throw new BuilderAgentError(
-      `Model did not return valid JSON: ${(e as Error).message} | head=${text.slice(0, 120).replace(/\n/g, "\\n")}`,
-    );
+    if (!text.includes("{")) {
+      console.log("[builder] model returned prose instead of JSON — retrying with stronger nudge");
+      if (state.apiCalls >= MAX_API_CALLS) {
+        throw new BuilderAgentError(`Exceeded MAX_API_CALLS (${MAX_API_CALLS})`);
+      }
+      const retryResp = await client.messages.create({
+        model: MODEL,
+        max_tokens: 16384,
+        system: systemMessage,
+        messages: [
+          { role: "user" as const, content: userMessage },
+          { role: "user" as const, content: `Your previous response was prose, not JSON:\n"${text.slice(0, 200)}…"\n\nRespond with ONLY the JSON object — no explanation, no markdown, no prose. Just {"files": [...], "verify_command": "..."}` },
+        ],
+      });
+      state.apiCalls += 1;
+      const retryUsage = retryResp.usage ?? { input_tokens: 0, output_tokens: 0 };
+      const retryCost = retryUsage.input_tokens * INPUT_PRICE + retryUsage.output_tokens * OUTPUT_PRICE;
+      state.tokensUsed += retryUsage.input_tokens + retryUsage.output_tokens;
+      state.costUsd += retryCost;
+      breaker.record(retryCost);
+      const retryText = extractText(retryResp);
+      try {
+        parsed = extractJson(retryText);
+      } catch (e2) {
+        throw new BuilderAgentError(
+          `Model did not return valid JSON after prose retry: ${(e2 as Error).message} | head=${retryText.slice(0, 120).replace(/\n/g, "\\n")}`,
+        );
+      }
+    } else {
+      throw new BuilderAgentError(
+        `Model did not return valid JSON: ${(e as Error).message} | head=${text.slice(0, 120).replace(/\n/g, "\\n")}`,
+      );
+    }
   }
   return validateTaskCodeGen(parsed);
 }
@@ -198,6 +238,19 @@ function buildTaskPrompt(
     lines.push("Produce a fix.");
   }
   lines.push(`Plan file_tree paths: ${plan.file_tree.map((f) => f.path).join(", ")}`);
+  if (task.type === "test") {
+    const mocks = generateMocks(spec);
+    const mockBlock = renderMockInstructions(mocks);
+    if (mockBlock) {
+      lines.push(mockBlock);
+    } else {
+      lines.push(
+        "\nNETWORK MOCKING (MANDATORY): All test files MUST mock external HTTP calls.",
+        "Override global fetch or use jest.mock/vi.mock. NEVER make real network requests from tests.",
+        "Generate realistic mock fixtures inline for any external endpoints the code under test calls.",
+      );
+    }
+  }
   if (existingFiles.size > 0) {
     lines.push(
       `\nFiles already written by earlier tasks in this build (you MUST stay consistent with their contents — do not redefine exports, change interfaces, or break tests they contain):`,
@@ -226,13 +279,32 @@ async function applyAndVerify(
   sandboxId: string,
   codegen: TaskCodeGen,
   collected: Map<string, string>,
+  taskType?: string,
 ): Promise<{ ok: boolean; stdout: string; stderr: string }> {
   for (const f of codegen.files) {
     await sandbox.writeFile(sandboxId, f.path, f.content);
     collected.set(f.path, f.content);
   }
+  if (taskType === "test") {
+    const runner = detectTestRunner(codegen.verify_command);
+    if (runner) {
+      console.log(`[builder] ensuring test runner "${runner}" is installed`);
+      await sandbox.runCommand(sandboxId, `npm install --save-dev ${runner} 2>/dev/null || true`);
+    }
+  }
   const res = await sandbox.runCommand(sandboxId, codegen.verify_command);
   return { ok: res.exitCode === 0, stdout: res.stdout, stderr: res.stderr };
+}
+
+/**
+ * Detect which test runner a verify command references.
+ * @param cmd verify command string
+ */
+function detectTestRunner(cmd: string): string | null {
+  if (/\bvitest\b/.test(cmd)) return "vitest";
+  if (/\bjest\b/.test(cmd)) return "jest";
+  if (/\bmocha\b/.test(cmd)) return "mocha";
+  return null;
 }
 
 /**
@@ -258,20 +330,51 @@ export async function runBuilderAgent(
   let status: BuildOutput["status"] = "success";
 
   try {
-    sandboxId = await sandbox.createSandbox();
+    // Match spec to a warm template and create a pre-provisioned sandbox
+    const templateName = matchTemplate(input.spec.description, input.spec.stack);
+    const preInstalled = getPreInstalledPackages(templateName);
+    console.log(`[builder] matched template: ${templateName}`);
+    sandboxId = await sandbox.createWarmSandbox(templateName);
 
-    if (input.plan.dependencies.length > 0) {
-      const installCmd = `npm install ${input.plan.dependencies.join(" ")}`;
+    // Only install deps that aren't already in the template
+    const extraDeps = input.plan.dependencies.filter((d) => {
+      const bare = d.replace(/@[^/].*$/, "");
+      return !preInstalled.has(bare);
+    });
+    if (extraDeps.length > 0) {
+      console.log(`[builder] installing ${extraDeps.length} extra deps (${preInstalled.size} pre-installed)`);
+      const installCmd = `npm install ${extraDeps.join(" ")}`;
       const installRes = await sandbox.runCommand(sandboxId, installCmd);
       if (installRes.exitCode !== 0) {
         state.errors.push(`dep install failed: ${installRes.stderr}`);
         status = "partial";
       }
+    } else if (input.plan.dependencies.length > 0) {
+      console.log(`[builder] all ${input.plan.dependencies.length} deps pre-installed by template`);
     }
 
     const orderedTasks = [...input.plan.tasks].sort((a, b) => a.order - b.order);
 
+    // Identify setup tasks that only install pre-installed deps (can be skipped)
+    const skippableTasks = new Set<string>();
     for (const task of orderedTasks) {
+      if (task.type === "setup" && isDepOnlySetup(task, preInstalled)) {
+        skippableTasks.add(task.id);
+      }
+    }
+
+    for (const task of orderedTasks) {
+      // Skip setup tasks whose only job is installing pre-installed packages
+      if (skippableTasks.has(task.id)) {
+        console.log(`[builder] skipping redundant setup task ${task.id}: deps pre-installed`);
+        testResults.push({
+          name: `${task.id}: ${task.description}`,
+          passed: true,
+          output: "skipped — dependencies pre-installed by warm sandbox",
+        });
+        continue;
+      }
+
       let attempt = 0;
       let lastFailure: { stdout: string; stderr: string } | undefined;
       let taskOk = false;
@@ -287,7 +390,7 @@ export async function runBuilderAgent(
             SYSTEM_PROMPT,
             buildTaskPrompt(input.spec, input.plan, task, lastFailure, input.rejection, collected),
           );
-          const result = await applyAndVerify(sandbox, sandboxId, codegen, collected);
+          const result = await applyAndVerify(sandbox, sandboxId, codegen, collected, task.type);
           testResults.push({
             name: `${task.id}: ${task.description}`,
             passed: result.ok,
@@ -312,7 +415,7 @@ export async function runBuilderAgent(
           if (err instanceof CircuitBreakerError) {
             state.errors.push(`circuit breaker tripped: ${err.message}`);
             status = "failed";
-            return finalize(sandbox, sandboxId, status, collected, testResults, state);
+            return finalize(sandbox, sandboxId, status, collected, testResults, state, input.spec);
           }
           state.errors.push(`task ${task.id} threw: ${String(err)}`);
           const sig = `throw:${String(err).slice(0, 200)}`;
@@ -330,16 +433,40 @@ export async function runBuilderAgent(
       if (!taskOk) {
         state.errors.push(`task ${task.id} failed after ${MAX_FIXES_PER_TASK} fix attempts`);
         status = "failed";
-        return finalize(sandbox, sandboxId, status, collected, testResults, state);
+        return finalize(sandbox, sandboxId, status, collected, testResults, state, input.spec);
       }
     }
 
-    return finalize(sandbox, sandboxId, status, collected, testResults, state);
+    return finalize(sandbox, sandboxId, status, collected, testResults, state, input.spec);
   } catch (err) {
     state.errors.push(`builder threw: ${String(err)}`);
-    return finalize(sandbox, sandboxId, "failed", collected, testResults, state);
+    return finalize(sandbox, sandboxId, "failed", collected, testResults, state, input.spec);
   }
 }
+
+/**
+ * Check if a setup task's only purpose is installing dependencies that
+ * are already pre-installed by the warm sandbox template.
+ * @param task a build task
+ * @param preInstalled set of pre-installed package names
+ */
+function isDepOnlySetup(task: BuildTask, preInstalled: Set<string>): boolean {
+  if (preInstalled.size === 0) return false;
+  const desc = task.description.toLowerCase();
+  // Match tasks like "Install dependencies", "Set up project dependencies", "npm install"
+  const isInstallTask = /\b(install|set\s*up)\b.*\b(dep|package|module|node_module)\b/i.test(desc)
+    || /\bnpm\s+install\b/i.test(desc)
+    || /\binitiali[sz]e\s+(project|package)\b/i.test(desc);
+  if (!isInstallTask) return false;
+  // If the task involves creating config files, don't skip it
+  const hasConfigFiles = task.files_involved.some((f) =>
+    /\.(json|ts|js|yml|yaml|toml)$/i.test(f) && !/package\.json$/i.test(f),
+  );
+  return !hasConfigFiles;
+}
+
+/** UI keyword patterns in the stack. */
+const UI_KEYWORDS = /\b(react|vue|svelte|angular|html|css|frontend|ui|nextjs|next\.js|remix|astro|vite)\b/i;
 
 /**
  * Tear down the sandbox and assemble the final BuildOutput.
@@ -351,7 +478,30 @@ async function finalize(
   collected: Map<string, string>,
   testResults: TestResult[],
   state: BuilderState,
+  spec?: SpecOutput,
 ): Promise<BuildOutput> {
+  let screenshot: string | undefined;
+
+  // Attempt screenshot for UI builds before destroying sandbox
+  if (sandboxId && status !== "failed" && spec) {
+    const haystack = [spec.description, ...spec.stack].join(" ");
+    if (UI_KEYWORDS.test(haystack)) {
+      try {
+        // Start a dev server in the background
+        await sandbox.runCommand(
+          sandboxId,
+          "(npx serve -s build -l 3000 2>/dev/null || npx vite preview --port 3000 2>/dev/null || npx serve -l 3000 2>/dev/null || npm start &) &",
+        );
+        await sandbox.runCommand(sandboxId, "sleep 3");
+        const result = await sandbox.takeScreenshot(sandboxId, "http://localhost:3000");
+        screenshot = result.base64Png;
+        console.log(`[builder] screenshot captured for ${sandboxId}`);
+      } catch (err) {
+        console.log(`[builder] screenshot failed (non-fatal): ${String(err).slice(0, 120)}`);
+      }
+    }
+  }
+
   if (sandboxId) {
     try {
       await sandbox.destroySandbox(sandboxId);
@@ -368,5 +518,6 @@ async function finalize(
     total_cost_usd: state.costUsd,
     sandbox_id: sandboxId,
     error_log: state.errors,
+    screenshot,
   };
 }

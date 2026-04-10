@@ -507,4 +507,238 @@ Qontrary cost ~20× and took ~15× longer than vanilla on the two successes. Wha
 
 ---
 
+---
+
+# Dogfood runs #18–#20 — 2026-04-10 (after network mocking)
+
+## Fix applied
+**Network mocking for Builder test tasks.** New `packages/core/src/utils/mock-generator.ts`:
+- `detectApis(spec)` scans description, stack, and acceptance criteria against a registry of known APIs (CoinGecko, Helius, DexScreener, Express/localhost) via alias matching.
+- `generateMocks(spec)` returns `ApiMockSpec[]` with realistic, deterministic mock response data for each detected endpoint (e.g. Helius returns 3 token balances for SOL/USDC/USDT, DexScreener returns 10 trending pairs with realistic names/prices/volumes).
+- `renderMockInstructions(mocks)` renders the mock data as a prompt block injected into `buildTaskPrompt` specifically for `test`-type tasks.
+
+Builder changes:
+- System prompt now includes: "All test files MUST mock external HTTP calls. NEVER make real network requests. Use supertest for servers."
+- `buildTaskPrompt` injects `renderMockInstructions(generateMocks(spec))` for test-type tasks. Falls back to a generic "mock all HTTP" instruction if no known APIs are detected.
+- 12 vitest unit tests for mock-generator (detect, generate, render), all passing.
+
+## Run #18 — Solana wallet CLI (Helius) ❌
+`qontrary "Create a CLI tool that takes a Solana wallet address and returns token balances using Helius API"`
+- **Attempt 1:** dep-install threw `SandboxError: CommandExitError: exit status 1` outside per-task loop (npm install failed in sandbox for 11 deps including bs58, jest-fetch-mock). 0 files, ~24s. Retried.
+- **Attempt 2 (recorded):** FAILED · build_1775802173755_7qpwni · 8-task plan · 7 partial files · 7 builder calls · 176.6s · **$0.2245**
+- **Failure:** `task test-validation` — exit 127 ×2, early-bail.
+- **Exit 127 = command not found.** The test task's verify command references a test runner binary (`jest` or `npx jest`) that isn't on the sandbox PATH. The mocking fix wouldn't have helped here — the test never got to *run*; the runner itself is missing. A sandbox-environment issue (either npm install didn't complete, or the binary needs `npx` prefix).
+- **Progress vs run #16:** Got through all setup/config/implement tasks (same as before). Failed one step earlier (test-validation vs test-2), same fundamental domain: test execution in sandbox. Cost down from $0.37 to $0.22.
+
+## Run #19 — Express todo API ✅
+`qontrary "Build an Express API with rate limiting, input validation, and error handling for a simple todo list"`
+- **Verdict:** **APPROVED** · build_1775802363677_zf2r3m · 12-task plan · **14 files** · 12 builder calls · 268.3s · **$0.4643**
+- **Round 1:** built 14 files, Contrarian APPROVEd in degraded mode (Gemini 503'd 3× → 2/3 Claude+GPT).
+- **Direct improvement over run #12** (FAILED on test-03, $0.54) **and run #17** (APPROVED, 12 files, $0.43). This run got 14 files through including all test tasks.
+- **The mock fix is plausibly load-bearing here.** Run #12 failed on `test-03` with `exit status 1` — a test task that couldn't pass. This run's test tasks passed cleanly. The system prompt's "mock all HTTP, use supertest" instruction + the Express/localhost mock data likely guided the model to generate tests that spin up the server via supertest instead of hitting a running process. 14 files is the highest APPROVED file count in the dogfood.
+- Gemini unavailable again, so consensus was 2/3. But the fact that all 12 tasks (including tests) passed in the sandbox before review is the real signal.
+
+## Run #20 — DexScreener scraper ❌
+`qontrary "Create a script that scrapes the top 10 trending tokens from DexScreener"`
+- **Attempt 1:** Planner `tasks[4] invalid` — model nondeterminism. Retried.
+- **Attempt 2 (recorded):** FAILED · build_1775802680402_0kfgff · 4-task plan · 4 partial files · 7 builder calls · 534.2s · **$0.6904**
+- **Failure:** `task task-4` (test task) — mix of exit 1 (test runner failed), model returned prose (`"Looking at the existing scrape.test.js file..."`), then E2B sandbox timed out.
+- **Progress vs run #13:** Run #13 failed on `config-typescript` with `files[0] invalid` (Builder output malformed, $0.03, 65s). This run got all the way through setup/config/implement to the test task — meaningful progress. Failed on test execution (exit 1), then the model broke discipline and returned prose instead of JSON, then the sandbox died. Three different failures in one task's retry loop.
+- **Mock data was in the prompt** (DexScreener API mock with 10 trending pairs was injected for this test task), but the model may not have wired it correctly into the test file. Cost jumped to $0.69 because per-call tokens ran 12k–19k (large prior-files context + mock data).
+
+## Aggregate (runs #18–#20)
+
+| Run | Task | Files | Calls | Time | Cost | Verdict | vs. previous |
+|---|---|---|---|---|---|---|---|
+| #18 | Solana CLI | 7 | 7 | 177s | $0.22 | ❌ test runner not found (exit 127) | #16: same domain, $0.37 |
+| #19 | Express todo | 14 | 12 | 268s | $0.46 | ✅ **APPROVED** | #12: FAILED $0.54 → #17: APPROVED $0.43 → **#19: APPROVED $0.46, 14 files** |
+| #20 | DexScreener | 4 | 7 | 534s | $0.69 | ❌ test failed + prose + sandbox timeout | #13: FAILED $0.03 (config malformed) |
+| **Total** | | **25** | **26** | **16.3 min** | **$1.38** | **1/3 APPROVED** | |
+
+## What the mock fix accomplished
+- **Run #19 Express todo: the clearest win.** This task failed on its test tasks in run #12 and now APPROVED with 14 files. The system prompt's "mock all HTTP, use supertest" instruction is the most plausible cause — tests that previously tried to reach a running server now use supertest to spin up and tear down the Express app in-process.
+- **Run #18 Solana: mocking didn't help because the failure was pre-execution** (exit 127, test runner binary not found). The mock data was there; the test never got to run it.
+- **Run #20 DexScreener: mock data was injected but the model hit other failures first** (test exit 1 before giving up and returning prose). The 10-pair DexScreener mock was in the prompt; unclear whether the model used it or ignored it.
+
+## What it didn't accomplish
+The mock registry approach (known-API detection + canned responses) helps when: (a) the API is in the registry, (b) the test runner is installed and on PATH, (c) the model reads and uses the mock data from the prompt. Run #19 hit all three; run #18 missed (b); run #20 missed (c) or hit a real test failure before the mock mattered.
+
+The fallback "mock all HTTP generically" instruction (for APIs not in the registry) relies entirely on the model generating its own realistic mock data, which is fine for simple cases but produces garbage for complex response shapes.
+
+---
+
+---
+
+# Dogfood runs #21–#22 — 2026-04-10 (test runner install + prose recovery + sandbox error handling)
+
+## Fixes applied
+1. **Test runner auto-install.** Before running a test-type task's verify command, the Builder now detects which runner the command references (`vitest`, `jest`, `mocha`) and runs `npm install --save-dev <runner>` in the sandbox. Fixes exit-127 (command not found) from run #18.
+2. **Prose recovery retry.** When `extractJson` fails and the model response contains no `{` at all (pure prose), `callModelForTask` makes one additional API call including the prose as context with a strong "JSON only" nudge. Addresses the `"Looking at the existing scrape.test.js file…"` failure from run #20.
+3. **System prompt: mandatory `npx` prefix for test verify commands.** `NEVER use bare jest, vitest, or pytest — the binary may not be on PATH.`
+4. **E2B `runCommand` error recovery.** The E2B SDK throws `CommandExitError` on non-zero exit. Previously this propagated as a SandboxError, making the Builder's dep-install step throw instead of gracefully degrading. Now the catch extracts the exit code from the error message and returns `{exitCode, stderr, stdout}`. This was the root cause of the Solana build's dep-install crash in runs #16 and #18 — the dep install returned exit 1 but the Builder never got to handle it.
+
+## Run #21 — Solana wallet CLI (Helius) ❌ (but major progress)
+`qontrary "Create a CLI tool that takes a Solana wallet address and returns token balances using Helius API"`
+
+Best of three attempts recorded (attempt 3):
+- **Verdict:** FAILED · build_1775804824758_t79w1a · 11-task plan · **10 files** · 11 builder calls · 334.4s · **$0.4716**
+- **Failure:** `task test-formatter` — exit 1 ×2 (real test failure, NOT exit 127), early-bail
+
+**What the fixes accomplished (measured against run #18):**
+- **Dep-install crash → graceful degradation.** Attempt 1 logged `dep install failed: CommandExitError: exit status 1` and continued (status: "partial") instead of throwing. The `runCommand` error-recovery fix is load-bearing.
+- **Exit 127 (command not found) → gone.** `[builder] ensuring test runner "jest" is installed` fired 4 times across test tasks. The runner was found; the tests *ran*. They just failed (exit 1).
+- **10 files = record for this task.** Previous best was 9 files (run #16). All setup/config/implement tasks passed cleanly.
+- **Failure is now in the test-content domain**, not the test-infrastructure domain. The mocks and runner are there; the test assertions don't match the implementation output. This is model code-quality, not framework plumbing.
+
+Attempts 1 and 2 failed earlier: attempt 1 at dep install (recovered, then `files[0] invalid` on config-01, $0.04), attempt 2 at `implement-helius-client` (verify exit 1 ×2, $0.12).
+
+## Run #22 — DexScreener scraper ✅
+`qontrary "Create a script that scrapes the top 10 trending tokens from DexScreener"`
+
+- **Verdict:** **APPROVED** · build_1775805175376_zy4u1t · 4-task plan · 4 files · 4 builder calls · 299.2s · **$0.3949**
+- **Round 1:** built 4 files, Contrarian APPROVEd in degraded mode (Gemini 503'd 3× → 2/3 Claude+GPT).
+- **`[builder] ensuring test runner "jest" is installed` fired once** for the test task → tests ran and passed in the sandbox. No exit 127.
+- **Direct improvement over runs #13 and #20.** Run #13: FAILED on config-typescript with malformed JSON ($0.03). Run #20: FAILED on task-4 with mix of exit 1 + prose + sandbox timeout ($0.69). This run: all 4 tasks passed first try.
+
+**What the Contrarian caught (critical EXECUTION_FAILURE):**
+> `scraper.js` defines `API_URL` as a hardcoded constant and never reads `process.env.DEXSCREENER_API_URL`. The test suite injects `DEXSCREENER_API_URL` into the child process environment to redirect all HTTP calls to a local mock server. Because the scraper ignores this variable, every spawned test process hits the real external API instead of the mock, making happy-path assertions, HTTP error simulation, and schema validation non-deterministic.
+
+Suggested fix: `const API_URL = process.env.DEXSCREENER_API_URL || 'https://api.dexscreener.com/...'`.
+
+This is a **real, actionable, high-quality issue** — the kind of thing that would pass a one-shot review ("it works locally") and break in CI or any environment where you need deterministic test behavior. The Contrarian identified the exact variable, the exact code path, and gave a one-line fix. Second time in the dogfood (after run #7a CSV) where the Contrarian caught something a one-shot wouldn't have.
+
+## Aggregate (runs #21–#22)
+
+| Run | Task | Files | Calls | Time | Cost | Verdict | vs. previous |
+|---|---|---|---|---|---|---|---|
+| #21 | Solana CLI | 10 | 11 | 334s | $0.47 | ❌ test failures (not infra) | #18: exit 127 → now exit 1 (tests run, just fail) |
+| #22 | DexScreener | 4 | 4 | 299s | $0.39 | ✅ **APPROVED** + real Contrarian catch | #20: FAILED $0.69 → APPROVED $0.39 |
+| **Total** | | **14** | **15** | **10.6 min** | **$0.87** | **1/2 APPROVED** | |
+
+## Running totals (all 22 dogfood runs)
+
+| Bucket | Count | Total |
+|---|---|---|
+| Total builds | 22 | **$9.26** |
+| ✅ Truly APPROVED | 8 | $4.16 |
+| ⚠️ False-positive (run #3, fixed) | 1 | $0.47 |
+| ❌ FAILED | 13 | $4.63 |
+
+---
+
 **(Run #2 takeaway, retained:)** Much better cost/time ratio than run #1 (~7× cost, ~10× time) because the spec was unambiguous and the Builder didn't churn. For a task this well-specified, vanilla Claude Code would also have produced a working answer first try — Qontrary's overhead bought a test file and an independent sign-off, not a behavioral difference. Two pre-flight bugs across two runs (JSON-fence in Spec, version-suffix in Planner) suggests the validation layer is too strict for what the LLMs actually emit; both fixes were one-liners.
+
+---
+
+## Run #23 — React Sortable Table (with Vision Review)
+**Task:** `qontrary "Create a React component that displays a sortable table of cryptocurrency data"`
+**Build ID:** `build_1775806408993_fzomux`
+
+### What we added before this run
+- **Vision Review for Contrarian Agent**: `takeScreenshot()` method on E2BSandbox, `VISUAL_MISMATCH` rejection category, multimodal content blocks for Claude (ClaudeContentBlock[]) and GPT (GPTContentPart[]), screenshot capture in Builder's finalize step for UI builds
+- Screenshot is non-fatal — if Chromium can't install in the sandbox, build proceeds normally
+
+### Pipeline
+| Stage | Result | Notes |
+|---|---|---|
+| Spec | `Sortable Cryptocurrency Data Table` | Clean, 1 API call |
+| Plan | 4 tasks | setup, components, test, config |
+| Build | **success** — 12 files | 4 API calls, vitest auto-installed |
+| Screenshot | Not captured | Puppeteer install failed in E2B (expected — needs custom template with Chromium) |
+| Contrarian | **APPROVE** (round 1) | Claude approve (conf 97), GPT approve (conf 0.95), Gemini 503 |
+
+### Files produced
+```
+package.json, tsconfig.json, tsconfig.node.json, vite.config.ts,
+tailwind.config.js, postcss.config.js, index.html,
+src/main.tsx, src/index.css, src/setupTests.ts,
+src/CryptoTable.tsx, src/CryptoTable.test.tsx
+```
+
+### Contrarian issues
+- 1 minor DIVERGENCE: `tsconfig.node.json` not in plan (standard Vite scaffolding, harmless)
+
+### Cost & time
+| Metric | Value |
+|---|---|
+| Build cost | $0.2070 |
+| Review cost | $0.0769 |
+| Total | **$0.2838** |
+| Time | 242.7s |
+
+### Verdict: ✅ APPROVED
+
+### Takeaway
+This was the same React sortable table task that failed in runs #5, #5b, and #7b due to infrastructure bugs (max_tokens truncation, missing cross-task file visibility, extractJson fence issues). After 15+ framework fixes across 22 builds, it now passes first try with a clean round-1 approval. The vision review pipeline is wired end-to-end but screenshot capture needs a custom E2B template with Chromium pre-installed — current sandbox can't `npm install puppeteer` (300MB Chromium download). This is a known limitation; the screenshot path is non-fatal by design so it degrades gracefully to code-only review.
+
+### Running totals
+| Bucket | Count | Total |
+|---|---|---|
+| Total builds | 23 | **$9.54** |
+| ✅ Truly APPROVED | 9 | $4.44 |
+| ⚠️ False-positive (run #3, fixed) | 1 | $0.47 |
+| ❌ FAILED | 13 | $4.63 |
+
+---
+
+## Run #24 — Express Health API (with Warm Sandbox Pools)
+**Task:** `qontrary "Build an Express API with one endpoint: GET /health returns { status: ok, timestamp }"`
+**Build ID:** `build_1775809365813_zcvh7e`
+
+### What we added before this run
+- **Warm Sandbox Pools** (`packages/core/src/sandbox/templates.ts`): 4 stack templates (`node-express`, `react`, `node-cli`, `base`) with pre-installed deps
+- `E2BSandbox.createWarmSandbox(template)`: creates sandbox, runs `npm install` for template packages, writes marker file to skip re-install on reuse
+- Builder auto-matches spec to best template via `matchTemplate()`, uses warm sandbox, filters out pre-installed deps, skips redundant setup tasks
+- Fixed `createWarmSandbox` bug: `test -f` marker check used raw E2B SDK (which throws `CommandExitError` on non-zero exit) instead of `this.runCommand()` which handles it gracefully
+
+### Pipeline
+| Stage | Result | Notes |
+|---|---|---|
+| Spec | `Express Health Check API` | Clean |
+| Plan | 3 tasks | Leaner plan than run #2 (3 vs 4 tasks) |
+| Build | **success** — 3 files | Template matched `node-express`, 3 pre-installed deps, only 1 extra dep installed |
+| Contrarian | **APPROVE** (round 1) | Claude approve (conf 97), GPT approve (conf 9), Gemini 503 |
+
+### Warm pool in action
+```
+[builder] matched template: node-express
+[e2b] warming sandbox sbx_1 with template node-express
+[e2b] sandbox sbx_1 warmed for node-express
+[builder] installing 1 extra deps (3 pre-installed)
+```
+
+### Files produced
+```
+package.json, index.js, index.test.js
+```
+
+### Comparison vs Run #2 (same task, no warm pools)
+| Metric | Run #2 | Run #24 | Delta |
+|---|---|---|---|
+| Total time | 103.6s | 105.2s | +1.5% (noise — Gemini 503 retries) |
+| Total cost | $0.071 | **$0.051** | **-28%** |
+| Build cost | $0.052 | **$0.034** | **-35%** |
+| Build tokens | 7729 | **5208** | **-33%** |
+| Sandbox time | ~90s | **65.8s** | **-27%** |
+| Files | 5 | 3 | Leaner (warm pool = fewer setup files) |
+
+### Cost & time
+| Metric | Value |
+|---|---|
+| Build cost | $0.0336 |
+| Review cost | $0.0172 |
+| Total | **$0.0509** |
+| Time | 105.2s |
+
+### Verdict: ✅ APPROVED
+
+### Takeaway
+Warm pools deliver **28% cost reduction** and **33% fewer tokens** for the same Express health API task. The time improvement is masked by Gemini's 503 retries (7s × 3 attempts = ~21s overhead), but sandbox usage dropped 27%. The real win is fewer build tokens: with deps pre-installed, the model generates a leaner plan (3 tasks vs 4) and doesn't waste tokens on setup instructions. The `createWarmSandbox` bug (using raw E2B SDK instead of `this.runCommand()` for marker check) was caught and fixed during this run — another instance of the E2B `CommandExitError` pattern from run #18.
+
+### Running totals
+| Bucket | Count | Total |
+|---|---|---|
+| Total builds | 24 | **$9.59** |
+| ✅ Truly APPROVED | 10 | $4.49 |
+| ⚠️ False-positive (run #3, fixed) | 1 | $0.47 |
+| ❌ FAILED | 13 | $4.63 |
