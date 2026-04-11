@@ -1044,6 +1044,25 @@ The task description said "single-file Python security audit tool" and `estimate
 
 ---
 
+## Real-World Case Study: Security Audit Tool
+
+**Build:** Run #30 — APPROVED in 2 rounds, $1.07, 738s
+**What:** Single-file Python security audit tool (audit.py) built entirely by Qontrary
+**Contrarian caught in round 1:** 4 real issues (function signature mismatches, wrong severity level) — all fixed in round 2
+
+**Deployed to production VPS and ran against live infrastructure:**
+- Scanned /docker/app-config and /data/workspace
+- Found 22 findings: 7 CRITICAL, 12 HIGH, 2 MEDIUM, 1 LOW
+- Critical findings included: cron jobs executing in world-writable directories, SSH root login enabled, scripts in /tmp running as root
+- These are real security issues on a live production server that were previously unknown
+
+**Why this matters:**
+This is the first tool built entirely by Qontrary that was deployed to production and found real issues. The adversarial pipeline caught 4 code bugs before the tool shipped — bugs that could have caused the security scanner itself to produce incorrect results. A security tool with bugs is worse than no security tool at all.
+
+Cost to build: $1.07. Value of findings: prevented potential root-level compromise via world-writable cron scripts.
+
+---
+
 ### Running totals
 | Bucket | Count | Total |
 |---|---|---|
