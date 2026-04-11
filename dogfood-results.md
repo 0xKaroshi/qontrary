@@ -802,10 +802,106 @@ Warm pools deliver **28% cost reduction** and **33% fewer tokens** for the same 
 ### Takeaway
 Kimi K2.5 works as a drop-in Gemini replacement via the OpenAI-compatible API. The tradeoff is clear: **full 3-model consensus costs ~$0.025 more and 33s longer** than degraded 2/3 mode, because of the Gemini retry delay (7s × 3) plus Kimi's response time. Kimi's confidence=1.0 and 4052 tokens suggest it's a thorough reviewer. The real value is eliminating the "degraded mode" warning — every build now gets a genuine third opinion instead of a footnote about Gemini being down.
 
+---
+
+## Run #26 — Python Security Audit CLI (complex, cross-language)
+
+**Task:** `Build a Python security audit tool (CLI) that scans a target directory and produces a JSON + HTML report. Features: (1) dependency vulnerability check via pip-audit, (2) static analysis for SQL injection / XSS / command injection patterns using AST parsing, (3) secrets detection (API keys, tokens, passwords in source), (4) file permission checker (world-writable files, SUID bits), (5) configuration audit (DEBUG=True, missing HTTPS, weak CORS), (6) summary risk score (critical/high/medium/low counts), (7) HTML report with collapsible sections and severity color coding. Stack: Python 3.11, click for CLI, jinja2 for HTML templating.`
+
+**Build ID:** `build_1775850588407_3cy0tq`
+**Template:** `node-cli` (mismatched — no Python template exists)
+**Time:** 239.3s | **Cost:** $0.207
+**API calls:** 4 | **Files:** 25 planned
+**Verdict:** FAILED
+
+**What happened:**
+1. **Spec agent:** Passed — generated a very detailed 21-criteria spec with 7 blind tests. `max_tokens: 8192` (bumped from 2048) handled the complex output. Prose recovery not needed.
+2. **Planner agent:** Passed — produced a 19-task plan with 25 files. `max_tokens: 16384` (bumped from 4096) handled the large plan. Dependencies correctly validated with new `isValidPackageName()` (was failing on pip-style names like `click>=8.1.7`).
+3. **Builder agent:** Failed at task T03 (`Implement secaudit/models.py` — dataclass models for all finding types). Failed after 5 fix attempts. The builder model couldn't get the Python dataclasses to pass the verify command in the E2B sandbox.
+4. **Contrarian:** Not reached.
+
+**Key issues fixed en route:**
+- `isValidNpmName` → `isValidPackageName`: Planner validation rejected pip packages like `click>=8.1.7`. Added `PIP_NAME` regex alongside existing `NPM_NAME` regex.
+- Spec agent `max_tokens` bumped from 2048 → 8192 (complex spec was getting truncated).
+- Planner agent `max_tokens` bumped from 4096 → 16384, `maxIterations` from 1 → 3.
+- Both agents got prose recovery retry (detect no `{` in response, retry with stronger JSON nudge).
+
+**Root cause analysis:**
+- 19 tasks is too granular for the builder — Python projects need fewer, larger tasks. The model struggles with incremental Python module builds because each task's verify command requires the full import chain to work.
+- Template mismatch: `node-cli` template was selected (no Python template exists). The warm pool pre-installed commander + vitest which are useless for a Python project. Need a `python` template.
+- The E2B sandbox has Python 3.11 available, but no `pip install` of click/jinja2/pytest was attempted before build tasks started because the warm pool only knows npm packages.
+
+**Improvement ideas:**
+- Add `python` and `python-flask` sandbox templates with pip packages
+- Instruct the planner to produce fewer tasks for Python projects (5-8 max)
+- Add language detection to template matching
+
+---
+
+---
+
+## Run #27 — Python Security Audit Tool (first successful Python build)
+
+**Task:** `Build a Python security audit tool that scans a Linux VPS for exposed secrets, insecure configs, and credential sprawl. [7 features]. stdlib only, no pip dependencies. --fix-permissions flag.`
+
+**Build ID:** `build_1775860508529_vhwn05`
+**Template:** `python-stdlib` (new Python template)
+**Time:** 1523.9s (25.4min) | **Cost:** $2.758
+**API calls:** ~16 across 3 rounds | **Files:** 17
+**Verdict:** ESCALATED (3 rounds, never reached consensus)
+
+**What happened:**
+1. **Spec agent:** Passed — complex 7-feature spec generated cleanly with max_tokens: 8192.
+2. **Planner agent:** 5 tasks (down from 19 in Run #26). Python constraints worked — grouped related modules, limited test files.
+3. **Build round 1:** SUCCESS — 5 API calls, 17 files, all verify commands passed. Tests ran with `python3 -m pytest`.
+4. **Contrarian round 1:** REJECT (Claude reject 97, GPT approve 10, Gemini reject 5). 9 issues found including critical function name mismatch.
+5. **Build round 2:** SUCCESS — 6 API calls (1 prose retry). Addressed some rejection reasons.
+6. **Contrarian round 2:** REJECT (Claude reject 82, GPT reject, Gemini reject). 7 issues remaining.
+7. **Build round 3:** SUCCESS — 5 API calls. Addressed more issues.
+8. **Contrarian round 3:** REJECT (Claude reject 82, GPT approve, Gemini reject). 5 issues remaining. ESCALATED (max rounds).
+
+**Contrarian findings (round 3, final):**
+- **critical** EXECUTION_FAILURE: `checks_docker.py` exports `check_docker_compose` but tests + cli import `check_docker_security` → ImportError
+- **critical** EXECUTION_FAILURE: `check_cron_jobs()` defined with no params but tests call it with keyword args → TypeError
+- **major** BLIND_TEST_FAIL: Docker findings silently swallowed due to ImportError above
+- **major** SPEC_VIOLATION: Missing detection of absent `user` field in docker-compose (defaults to root)
+- **minor** SPEC_VIOLATION: `__main__.py` doesn't propagate exit code via `sys.exit(main())`
+
+**Output files (17):**
+```
+audit/__init__.py, audit/__main__.py, audit/checks_cron.py, audit/checks_docker.py,
+audit/checks_files.py, audit/checks_network.py, audit/checks_ssh.py, audit/cli.py,
+audit/dedup.py, audit/models.py, audit/patterns.py, audit/reporter.py, audit/scanner.py,
+pyproject.toml, tests/__init__.py, tests/test_checks.py, tests/test_scanner.py
+```
+
+**Python support changes that made this possible:**
+- Added `python-stdlib`, `python-cli`, `python-web` sandbox templates with pip packages
+- Template matcher: "python" → python-cli, "flask/django/fastapi" → python-web, "stdlib only/no pip" → python-stdlib
+- E2B runner: uses `pip install` for Python templates, added `runPython()` helper
+- Builder: detects Python runtime, uses `python3 -m pytest` for tests, `pip install` for deps, Python-specific system prompt
+- Planner: Python projects get 4-6 tasks (not 15-19), max 2 test files, 150-line file limit
+- E2B sandbox timeout: 5min → 10min (Python builds take longer)
+- Builder prose recovery: now retries on ALL extractJson failures (not just prose-only), preventing early-bail on truncated JSON
+- CommandExitError: now extracts stdout/stderr properties from error object (prevents identical error signatures triggering early-bail)
+
+**Comparison to Run #26:**
+| Metric | Run #26 | Run #27 |
+|---|---|---|
+| Template | node-cli (wrong) | python-stdlib (correct) |
+| Tasks | 19 (too many) | 5 (right-sized) |
+| Build status | FAILED at task T03 | 3x SUCCESS |
+| Contrarian | Never reached | 3 rounds, ESCALATED |
+| Files written | 0 usable | 17 complete |
+| Cost | $0.207 | $2.758 |
+
+---
+
 ### Running totals
 | Bucket | Count | Total |
 |---|---|---|
-| Total builds | 25 | **$9.67** |
+| Total builds | 27 | **$12.64** |
 | ✅ Truly APPROVED | 11 | $4.57 |
+| ⚠️ ESCALATED | 1 | $2.76 |
 | ⚠️ False-positive (run #3, fixed) | 1 | $0.47 |
-| ❌ FAILED | 13 | $4.63 |
+| ❌ FAILED | 14 | $4.84 |

@@ -188,7 +188,7 @@ export async function runSpecAgent(
 
     const resp = await client.messages.create({
       model: MODEL,
-      max_tokens: 2048,
+      max_tokens: 8192,
       system: SYSTEM_PROMPT,
       messages: [{ role: "user", content: buildUserPrompt(input) }],
     });
@@ -202,7 +202,29 @@ export async function runSpecAgent(
     try {
       parsed = extractJson(text);
     } catch {
-      throw new SpecAgentError("Model did not return valid JSON");
+      // Prose recovery: if the model didn't return JSON, retry with a stronger nudge
+      if (!text.includes("{")) {
+        console.log("[spec] model returned prose instead of JSON — retrying");
+        const retryResp = await client.messages.create({
+          model: MODEL,
+          max_tokens: 8192,
+          system: SYSTEM_PROMPT,
+          messages: [
+            { role: "user" as const, content: buildUserPrompt(input) },
+            { role: "user" as const, content: `Your previous response was prose, not JSON. Respond with ONLY the JSON object — no explanation, no markdown.` },
+          ],
+        });
+        const retryUsage = retryResp.usage ?? { input_tokens: 0, output_tokens: 0 };
+        breaker.record(retryUsage.input_tokens * INPUT_PRICE + retryUsage.output_tokens * OUTPUT_PRICE);
+        const retryText = extractText(retryResp);
+        try {
+          parsed = extractJson(retryText);
+        } catch {
+          throw new SpecAgentError(`Model did not return valid JSON after retry | head=${retryText.slice(0, 120).replace(/\n/g, "\\n")}`);
+        }
+      } else {
+        throw new SpecAgentError(`Model did not return valid JSON | head=${text.slice(0, 120).replace(/\n/g, "\\n")}`);
+      }
     }
     return validateSpec(parsed);
   } catch (err) {

@@ -76,7 +76,7 @@ export class E2BSandbox {
   constructor(factory?: SandboxFactory) {
     this.factory =
       factory ??
-      (async () => (await Sandbox.create()) as unknown as E2BSandboxLike);
+      (async () => (await Sandbox.create({ timeoutMs: 10 * 60_000 })) as unknown as E2BSandboxLike);
   }
 
   /**
@@ -119,8 +119,11 @@ export class E2BSandbox {
         return id;
       }
 
-      // Install template packages
-      const installCmd = `npm install ${tpl.packages.join(" ")} 2>&1`;
+      // Install template packages — use pip for Python, npm for Node
+      const installCmd =
+        tpl.runtime === "python"
+          ? `pip install ${tpl.packages.join(" ")} 2>&1`
+          : `npm install ${tpl.packages.join(" ")} 2>&1`;
       console.log(`[e2b] warming sandbox ${id} with template ${templateName}`);
       const installRes = await this.runCommand(id, installCmd);
       if (installRes.exitCode !== 0) {
@@ -212,10 +215,26 @@ export class E2BSandbox {
       const msg = String(err);
       const exitMatch = msg.match(/exit status (\d+)/);
       if (exitMatch) {
-        return { stdout: "", stderr: msg, exitCode: Number(exitMatch[1]) };
+        // CommandExitError may carry stdout/stderr as properties
+        const errObj = err as Record<string, unknown>;
+        const stdout = typeof errObj.stdout === "string" ? errObj.stdout : "";
+        const stderr = typeof errObj.stderr === "string" ? errObj.stderr : msg;
+        return { stdout, stderr, exitCode: Number(exitMatch[1]) };
       }
       throw err instanceof SandboxError ? err : new SandboxError(`runCommand failed: ${msg}`);
     }
+  }
+
+  /**
+   * Run a Python script inside the sandbox.
+   * Writes the script to a temp file and executes it with python3.
+   * @param id sandbox id
+   * @param script Python source code to execute
+   */
+  async runPython(id: string, script: string): Promise<CommandResult> {
+    const scriptPath = `/tmp/_run_${Date.now()}.py`;
+    await this.writeFile(id, scriptPath, script);
+    return this.runCommand(id, `python3 ${scriptPath}`);
   }
 
   /**

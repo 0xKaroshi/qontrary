@@ -5,7 +5,7 @@ import type { AnthropicLike, SpecOutput } from "./spec-agent.js";
 import type { BuildTask, PlanOutput } from "./planner-agent.js";
 import { extractJson } from "../utils/extract-json.js";
 import { generateMocks, renderMockInstructions } from "../utils/mock-generator.js";
-import { matchTemplate, getPreInstalledPackages } from "../sandbox/templates.js";
+import { matchTemplate, getPreInstalledPackages, isPythonProject, TEMPLATES } from "../sandbox/templates.js";
 
 /** A critique passed back from the Contrarian when retrying a build. */
 export interface ContrarianRejection {
@@ -61,7 +61,7 @@ const MAX_FIXES_PER_TASK = 5;
 const MAX_API_CALLS = 30;
 const MAX_COST_USD = 5;
 
-const SYSTEM_PROMPT = `You are a senior software engineer executing a single build task.
+const SYSTEM_PROMPT_NODE = `You are a senior software engineer executing a single build task.
 
 Given a task, the surrounding plan, and any prior error output, produce the exact files that should exist on disk after this task is done. Output only what changes for THIS task.
 
@@ -84,6 +84,40 @@ Override global fetch or use jest.mock/vi.mock to intercept HTTP. If mock data i
 Tests that require a running server (Express/WebSocket) MUST use supertest or start/stop the server in setup/teardown — never rely on a pre-running server process.
 
 Common dependencies may be pre-installed in the sandbox. Do not generate setup tasks that only run \`npm install\` for packages that are already present. If a setup task's only purpose is installing dependencies, use a simple file-existence check as verify_command.`;
+
+const SYSTEM_PROMPT_PYTHON = `You are a senior software engineer executing a single build task for a Python project.
+
+Given a task, the surrounding plan, and any prior error output, produce the exact files that should exist on disk after this task is done. Output only what changes for THIS task.
+
+Respond with ONLY a single JSON object — no prose, no markdown fences:
+{
+  "files": { "path": string, "content": string }[],
+  "verify_command": string
+}
+
+verify_command is a single shell command that exits 0 when the task is correct.
+
+CRITICAL rules for verify_command, by task type:
+- task type "setup" or "config": verify_command MUST be a simple file-existence check, e.g. \`test -f pyproject.toml\` (or \`test -f a && test -f b\` for multiple files). DO NOT run \`python3\`, \`pip\`, or any tool that depends on other files existing.
+- task type "implement": prefer \`python3 -c "import module_name"\` to verify the module is syntactically valid and importable. For scripts, use \`python3 -c "compile(open('path').read(), 'path', 'exec')"\`. Only import the module if all its dependencies are available.
+- task type "test": use \`python3 -m pytest tests/ -q\` or \`python3 -m pytest path/to/test_file.py -q\`. NEVER use bare \`pytest\` — use \`python3 -m pytest\` to ensure correct Python path.
+- If you genuinely cannot verify anything for this task, return "true".
+
+CRITICAL: All test files MUST mock external calls using unittest.mock.patch or pytest monkeypatch.
+Tests must NEVER make real network requests or run real subprocesses.
+
+CRITICAL: This is a Python project. Do NOT use npm, node, npx, vitest, jest, or any Node.js tools.
+Use pip for package installation, python3 for execution, and python3 -m pytest for testing.
+
+Common dependencies may be pre-installed in the sandbox (pytest, pytest-cov). Do not reinstall them.`;
+
+/**
+ * Select the appropriate system prompt based on project runtime.
+ * @param isPython whether the project targets Python
+ */
+function getSystemPrompt(isPython: boolean): string {
+  return isPython ? SYSTEM_PROMPT_PYTHON : SYSTEM_PROMPT_NODE;
+}
 
 /** Per-task code-gen response from the model. */
 interface TaskCodeGen {
@@ -173,37 +207,32 @@ async function callModelForTask(
   try {
     parsed = extractJson(text);
   } catch (e) {
-    if (!text.includes("{")) {
-      console.log("[builder] model returned prose instead of JSON — retrying with stronger nudge");
-      if (state.apiCalls >= MAX_API_CALLS) {
-        throw new BuilderAgentError(`Exceeded MAX_API_CALLS (${MAX_API_CALLS})`);
-      }
-      const retryResp = await client.messages.create({
-        model: MODEL,
-        max_tokens: 16384,
-        system: systemMessage,
-        messages: [
-          { role: "user" as const, content: userMessage },
-          { role: "user" as const, content: `Your previous response was prose, not JSON:\n"${text.slice(0, 200)}…"\n\nRespond with ONLY the JSON object — no explanation, no markdown, no prose. Just {"files": [...], "verify_command": "..."}` },
-        ],
-      });
-      state.apiCalls += 1;
-      const retryUsage = retryResp.usage ?? { input_tokens: 0, output_tokens: 0 };
-      const retryCost = retryUsage.input_tokens * INPUT_PRICE + retryUsage.output_tokens * OUTPUT_PRICE;
-      state.tokensUsed += retryUsage.input_tokens + retryUsage.output_tokens;
-      state.costUsd += retryCost;
-      breaker.record(retryCost);
-      const retryText = extractText(retryResp);
-      try {
-        parsed = extractJson(retryText);
-      } catch (e2) {
-        throw new BuilderAgentError(
-          `Model did not return valid JSON after prose retry: ${(e2 as Error).message} | head=${retryText.slice(0, 120).replace(/\n/g, "\\n")}`,
-        );
-      }
-    } else {
+    // Model returned prose or malformed JSON — retry with stronger nudge
+    console.log(`[builder] extractJson failed — retrying with stronger nudge (has braces: ${text.includes("{")})`);
+    if (state.apiCalls >= MAX_API_CALLS) {
+      throw new BuilderAgentError(`Exceeded MAX_API_CALLS (${MAX_API_CALLS})`);
+    }
+    const retryResp = await client.messages.create({
+      model: MODEL,
+      max_tokens: 16384,
+      system: systemMessage,
+      messages: [
+        { role: "user" as const, content: userMessage },
+        { role: "user" as const, content: `Your previous response was not valid JSON. It started with:\n"${text.slice(0, 200)}…"\n\nYou MUST respond with ONLY the JSON object — no explanation, no thinking, no markdown, no prose before or after. Start your response with the opening brace. Just {"files": [...], "verify_command": "..."}` },
+      ],
+    });
+    state.apiCalls += 1;
+    const retryUsage = retryResp.usage ?? { input_tokens: 0, output_tokens: 0 };
+    const retryCost = retryUsage.input_tokens * INPUT_PRICE + retryUsage.output_tokens * OUTPUT_PRICE;
+    state.tokensUsed += retryUsage.input_tokens + retryUsage.output_tokens;
+    state.costUsd += retryCost;
+    breaker.record(retryCost);
+    const retryText = extractText(retryResp);
+    try {
+      parsed = extractJson(retryText);
+    } catch (e2) {
       throw new BuilderAgentError(
-        `Model did not return valid JSON: ${(e as Error).message} | head=${text.slice(0, 120).replace(/\n/g, "\\n")}`,
+        `Model did not return valid JSON after retry: ${(e2 as Error).message} | head=${retryText.slice(0, 120).replace(/\n/g, "\\n")}`,
       );
     }
   }
@@ -280,16 +309,20 @@ async function applyAndVerify(
   codegen: TaskCodeGen,
   collected: Map<string, string>,
   taskType?: string,
+  python?: boolean,
 ): Promise<{ ok: boolean; stdout: string; stderr: string }> {
   for (const f of codegen.files) {
     await sandbox.writeFile(sandboxId, f.path, f.content);
     collected.set(f.path, f.content);
   }
   if (taskType === "test") {
-    const runner = detectTestRunner(codegen.verify_command);
+    const runner = detectTestRunner(codegen.verify_command, python);
     if (runner) {
       console.log(`[builder] ensuring test runner "${runner}" is installed`);
-      await sandbox.runCommand(sandboxId, `npm install --save-dev ${runner} 2>/dev/null || true`);
+      const installCmd = python
+        ? `pip install ${runner} 2>/dev/null || true`
+        : `npm install --save-dev ${runner} 2>/dev/null || true`;
+      await sandbox.runCommand(sandboxId, installCmd);
     }
   }
   const res = await sandbox.runCommand(sandboxId, codegen.verify_command);
@@ -299,8 +332,13 @@ async function applyAndVerify(
 /**
  * Detect which test runner a verify command references.
  * @param cmd verify command string
+ * @param python whether this is a Python project
  */
-function detectTestRunner(cmd: string): string | null {
+function detectTestRunner(cmd: string, python?: boolean): string | null {
+  if (python) {
+    if (/\bpytest\b/.test(cmd)) return "pytest";
+    return null;
+  }
   if (/\bvitest\b/.test(cmd)) return "vitest";
   if (/\bjest\b/.test(cmd)) return "jest";
   if (/\bmocha\b/.test(cmd)) return "mocha";
@@ -333,17 +371,22 @@ export async function runBuilderAgent(
     // Match spec to a warm template and create a pre-provisioned sandbox
     const templateName = matchTemplate(input.spec.description, input.spec.stack);
     const preInstalled = getPreInstalledPackages(templateName);
-    console.log(`[builder] matched template: ${templateName}`);
+    const python = TEMPLATES[templateName]?.runtime === "python";
+    const systemPrompt = getSystemPrompt(python);
+    console.log(`[builder] matched template: ${templateName} (runtime: ${python ? "python" : "node"})`);
     sandboxId = await sandbox.createWarmSandbox(templateName);
 
     // Only install deps that aren't already in the template
     const extraDeps = input.plan.dependencies.filter((d) => {
-      const bare = d.replace(/@[^/].*$/, "");
+      // Strip version specifiers: npm (@scope/pkg@1.0 → @scope/pkg) and pip (click>=8.0 → click)
+      const bare = d.replace(/[@>=<~!][^/].*$/, "");
       return !preInstalled.has(bare);
     });
     if (extraDeps.length > 0) {
       console.log(`[builder] installing ${extraDeps.length} extra deps (${preInstalled.size} pre-installed)`);
-      const installCmd = `npm install ${extraDeps.join(" ")}`;
+      const installCmd = python
+        ? `pip install ${extraDeps.join(" ")} 2>&1`
+        : `npm install ${extraDeps.join(" ")}`;
       const installRes = await sandbox.runCommand(sandboxId, installCmd);
       if (installRes.exitCode !== 0) {
         state.errors.push(`dep install failed: ${installRes.stderr}`);
@@ -387,10 +430,10 @@ export async function runBuilderAgent(
             client,
             breaker,
             state,
-            SYSTEM_PROMPT,
+            systemPrompt,
             buildTaskPrompt(input.spec, input.plan, task, lastFailure, input.rejection, collected),
           );
-          const result = await applyAndVerify(sandbox, sandboxId, codegen, collected, task.type);
+          const result = await applyAndVerify(sandbox, sandboxId, codegen, collected, task.type, python);
           testResults.push({
             name: `${task.id}: ${task.description}`,
             passed: result.ok,
@@ -453,14 +496,14 @@ export async function runBuilderAgent(
 function isDepOnlySetup(task: BuildTask, preInstalled: Set<string>): boolean {
   if (preInstalled.size === 0) return false;
   const desc = task.description.toLowerCase();
-  // Match tasks like "Install dependencies", "Set up project dependencies", "npm install"
+  // Match tasks like "Install dependencies", "Set up project dependencies", "npm/pip install"
   const isInstallTask = /\b(install|set\s*up)\b.*\b(dep|package|module|node_module)\b/i.test(desc)
-    || /\bnpm\s+install\b/i.test(desc)
+    || /\b(npm|pip)\s+install\b/i.test(desc)
     || /\binitiali[sz]e\s+(project|package)\b/i.test(desc);
   if (!isInstallTask) return false;
   // If the task involves creating config files, don't skip it
   const hasConfigFiles = task.files_involved.some((f) =>
-    /\.(json|ts|js|yml|yaml|toml)$/i.test(f) && !/package\.json$/i.test(f),
+    /\.(json|ts|js|yml|yaml|toml)$/i.test(f) && !/package\.json$/i.test(f) && !/pyproject\.toml$/i.test(f),
   );
   return !hasConfigFiles;
 }

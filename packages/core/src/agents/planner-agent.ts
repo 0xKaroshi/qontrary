@@ -1,6 +1,7 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { CircuitBreaker } from "../pipeline/circuit-breaker.js";
 import { extractJson } from "../utils/extract-json.js";
+import { isPythonProject } from "../sandbox/templates.js";
 import type { SpecOutput, AnthropicLike } from "./spec-agent.js";
 
 /** A single ordered build task. */
@@ -60,12 +61,30 @@ Respond with ONLY a single JSON object — no prose, no markdown fences:
 /**
  * Build the user prompt for the Planner from a SpecOutput.
  * The full spec (without blind_tests) is included.
+ * Adds Python-specific planning constraints when the spec targets Python.
  * @param spec spec output
  */
 function buildUserPrompt(spec: SpecOutput): string {
   const { blind_tests: _omit, ...pub } = spec;
   void _omit;
-  return `Spec:\n${JSON.stringify(pub, null, 2)}`;
+  const lines = [`Spec:\n${JSON.stringify(pub, null, 2)}`];
+
+  if (isPythonProject(spec.description, spec.stack)) {
+    lines.push(`
+IMPORTANT — Python project constraints:
+- Generate 4 to 6 tasks. Python's import chain means tasks cannot be as granular as Node.js, but avoid putting the entire implementation in a single massive task.
+- Split the implementation across 2-4 "implement" tasks, each producing 1-2 files. Each file MUST be under 150 lines. If a module would be longer, split it into separate files.
+- Group tightly-coupled Python modules into single tasks, but keep each task's total output under 300 lines across all files.
+- For dependencies, use pip package names with version specifiers (e.g. "click>=8.1.0", "pytest>=8.0").
+- Use "setup" type for tasks that create pyproject.toml / setup files and install deps.
+- Use "python3 -c 'import module'" or "python3 -m pytest" for verify commands, not node/npm.
+- Combine all data models, types, and enums into one task with the core implementation.
+- Combine all tests into a single "test" task with AT MOST 2 test files. Keep test files concise — test the most critical paths only.
+- NEVER put everything into a single monolithic file. Split into multiple focused modules.
+- The builder can only generate ~16000 tokens per task. Keep each task's total file content under 400 lines. If a test task has too many files, reduce to 1-2 test files covering the critical logic.`);
+  }
+
+  return lines.join("\n");
 }
 
 /**
@@ -83,15 +102,21 @@ function extractText(resp: { content: { type: string; text?: string }[] }): stri
 // npm package name validation (https://github.com/npm/validate-npm-package-name simplified)
 const NPM_NAME = /^(?:@[a-z0-9-~][a-z0-9-._~]*\/)?[a-z0-9-~][a-z0-9-._~]*$/;
 
+// pip package name: allows letters, digits, hyphens, underscores, dots, brackets, version specifiers
+const PIP_NAME = /^[a-zA-Z0-9][a-zA-Z0-9._-]*(?:\[[\w,]+\])?(?:[><=!~]+[\d.*]+(?:,\s*[><=!~]+[\d.*]+)*)?$/;
+
 /**
- * Validate that a string looks like a real npm package name.
+ * Validate that a string looks like a real package name (npm or pip).
  * @param name candidate package name
  */
-function isValidNpmName(name: string): boolean {
-  if (typeof name !== "string" || name.length === 0) return false;
+function isValidPackageName(name: string): boolean {
+  if (typeof name !== "string" || name.length === 0 || name.length > 214) return false;
+  // Try npm format first (handles @scope/pkg@version)
   const at = name.lastIndexOf("@");
   const bare = at > 0 ? name.slice(0, at) : name;
-  return bare.length > 0 && bare.length <= 214 && NPM_NAME.test(bare);
+  if (bare.length > 0 && NPM_NAME.test(bare)) return true;
+  // Try pip format (handles pkg>=1.0, pkg[extra])
+  return PIP_NAME.test(name);
 }
 
 /**
@@ -168,8 +193,8 @@ function validatePlan(raw: unknown): PlanOutput {
 
     const dependencies: string[] = r.dependencies.map(String);
     for (const dep of dependencies) {
-      if (!isValidNpmName(dep)) {
-        throw new PlannerAgentError(`Invalid npm package name: ${dep}`);
+      if (!isValidPackageName(dep)) {
+        throw new PlannerAgentError(`Invalid package name: ${dep}`);
       }
     }
 
@@ -212,13 +237,13 @@ export async function runPlannerAgent(
   opts: RunPlannerAgentOptions = {},
 ): Promise<PlanOutput> {
   try {
-    const breaker = opts.breaker ?? new CircuitBreaker({ maxCostUsd: 1, maxIterations: 1 });
+    const breaker = opts.breaker ?? new CircuitBreaker({ maxCostUsd: 1, maxIterations: 3 });
     const client: AnthropicLike =
       opts.client ?? (new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY }) as unknown as AnthropicLike);
 
     const resp = await client.messages.create({
       model: MODEL,
-      max_tokens: 4096,
+      max_tokens: 16384,
       system: SYSTEM_PROMPT,
       messages: [{ role: "user", content: buildUserPrompt(spec) }],
     });
@@ -232,7 +257,29 @@ export async function runPlannerAgent(
     try {
       parsed = extractJson(text);
     } catch {
-      throw new PlannerAgentError("Model did not return valid JSON");
+      // Prose recovery: retry with a stronger nudge
+      if (!text.includes("{")) {
+        console.log("[planner] model returned prose instead of JSON — retrying");
+        const retryResp = await client.messages.create({
+          model: MODEL,
+          max_tokens: 16384,
+          system: SYSTEM_PROMPT,
+          messages: [
+            { role: "user" as const, content: buildUserPrompt(spec) },
+            { role: "user" as const, content: `Your previous response was prose, not JSON. Respond with ONLY the JSON object — no explanation, no markdown.` },
+          ],
+        });
+        const retryUsage = retryResp.usage ?? { input_tokens: 0, output_tokens: 0 };
+        breaker.record(retryUsage.input_tokens * INPUT_PRICE + retryUsage.output_tokens * OUTPUT_PRICE);
+        const retryText = extractText(retryResp);
+        try {
+          parsed = extractJson(retryText);
+        } catch {
+          throw new PlannerAgentError(`Model did not return valid JSON after retry | head=${retryText.slice(0, 120).replace(/\n/g, "\\n")}`);
+        }
+      } else {
+        throw new PlannerAgentError(`Model did not return valid JSON | head=${text.slice(0, 120).replace(/\n/g, "\\n")}`);
+      }
     }
     return validatePlan(parsed);
   } catch (err) {

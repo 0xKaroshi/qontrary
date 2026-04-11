@@ -15,6 +15,16 @@ const spec: SpecOutput = {
   blind_tests: [],
 };
 
+const pythonSpec: SpecOutput = {
+  title: "Security Scanner",
+  description: "Python security audit tool",
+  acceptance_criteria: ["scans for secrets"],
+  stack: ["Python 3.11", "click"],
+  estimated_files: 3,
+  estimated_complexity: "medium",
+  blind_tests: [],
+};
+
 const plan: PlanOutput = {
   tasks: [
     { id: "t1", order: 1, description: "Write hello.js", files_involved: ["hello.js"], depends_on: [], type: "implement" },
@@ -28,7 +38,24 @@ const plan: PlanOutput = {
   estimated_token_budget: 1000,
 };
 
+const pythonPlan: PlanOutput = {
+  tasks: [
+    { id: "t1", order: 1, description: "Create project scaffold", files_involved: ["pyproject.toml", "scanner/__init__.py"], depends_on: [], type: "setup" },
+    { id: "t2", order: 2, description: "Implement scanner", files_involved: ["scanner/main.py"], depends_on: ["t1"], type: "implement" },
+    { id: "t3", order: 3, description: "Write tests", files_involved: ["tests/test_scanner.py"], depends_on: ["t2"], type: "test" },
+  ],
+  file_tree: [
+    { path: "pyproject.toml", purpose: "manifest", estimated_lines: 15 },
+    { path: "scanner/__init__.py", purpose: "init", estimated_lines: 1 },
+    { path: "scanner/main.py", purpose: "scanner", estimated_lines: 100 },
+    { path: "tests/test_scanner.py", purpose: "tests", estimated_lines: 50 },
+  ],
+  dependencies: ["click>=8.1.0"],
+  estimated_token_budget: 20000,
+};
+
 const input: BuilderInput = { spec, plan };
+const pythonInput: BuilderInput = { spec: pythonSpec, plan: pythonPlan };
 
 /** Build a fake sandbox whose runCommand returns the supplied exit codes in order. */
 function fakeSandboxFactory(exitCodes: number[]): { sandbox: E2BSandbox; runs: string[] } {
@@ -73,6 +100,26 @@ function mockClient(tokensPerCall = 100): AnthropicLike {
   };
 }
 
+/** Build a mock Anthropic client returning Python codegen JSON. */
+function mockPythonClient(tokensPerCall = 100): AnthropicLike {
+  return {
+    messages: {
+      create: async () => ({
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({
+              files: [{ path: "scanner/main.py", content: "import click\n" }],
+              verify_command: "python3 -m pytest tests/ -q",
+            }),
+          },
+        ],
+        usage: { input_tokens: tokensPerCall, output_tokens: tokensPerCall },
+      }),
+    },
+  };
+}
+
 describe("runBuilderAgent", () => {
   it("successful build: all tasks complete and verify passes", async () => {
     const { sandbox } = fakeSandboxFactory([0, 0]);
@@ -107,5 +154,29 @@ describe("runBuilderAgent", () => {
     const out = await runBuilderAgent(input, { client: mockClient(10000), sandbox, breaker });
     expect(out.status).toBe("failed");
     expect(out.error_log.some((e) => e.includes("circuit breaker"))).toBe(true);
+  });
+
+  it("Python build: uses pip for dep installation", async () => {
+    const { sandbox, runs } = fakeSandboxFactory([0, 0, 0]);
+    await runBuilderAgent(pythonInput, { client: mockPythonClient(), sandbox });
+    const pipCmds = runs.filter((r) => r.startsWith("pip install"));
+    expect(pipCmds.length).toBeGreaterThanOrEqual(1);
+    // Should have a pip install that includes click (the extra dep)
+    const clickInstall = pipCmds.find((r) => r.includes("click"));
+    expect(clickInstall).toBeDefined();
+  });
+
+  it("Python build: uses python3 -m pytest for test verify", async () => {
+    const { sandbox, runs } = fakeSandboxFactory([0, 0, 0]);
+    await runBuilderAgent(pythonInput, { client: mockPythonClient(), sandbox });
+    const pytestCmd = runs.find((r) => r.includes("python3 -m pytest"));
+    expect(pytestCmd).toBeDefined();
+  });
+
+  it("Python build: installs pytest via pip for test tasks", async () => {
+    const { sandbox, runs } = fakeSandboxFactory([0, 0, 0]);
+    await runBuilderAgent(pythonInput, { client: mockPythonClient(), sandbox });
+    const pipPytest = runs.find((r) => r.includes("pip install pytest"));
+    expect(pipPytest).toBeDefined();
   });
 });
