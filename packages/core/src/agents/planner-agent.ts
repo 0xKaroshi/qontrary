@@ -70,7 +70,21 @@ function buildUserPrompt(spec: SpecOutput): string {
   const lines = [`Spec:\n${JSON.stringify(pub, null, 2)}`];
 
   if (isPythonProject(spec.description, spec.stack)) {
-    lines.push(`
+    const isSingleFile = /\bsingle[- ]file\b/i.test(spec.description) || /\bone\s+file\b/i.test(spec.description) || /\bno\s+imports?\s+from\s+local\b/i.test(spec.description);
+
+    if (isSingleFile) {
+      lines.push(`
+IMPORTANT — Single-file Python project constraints:
+- The user explicitly requested a SINGLE FILE. Do NOT create auxiliary modules, packages, or local imports.
+- Generate EXACTLY 2 or 3 tasks: one "setup" (create pyproject.toml if needed), one "implement" (the single file), and optionally one "test".
+- The implement task produces EXACTLY ONE Python file. All logic goes in that file — no audit_lib/, no utils.py, no splitting.
+- file_tree must contain at most 3-4 entries: the main .py file, an optional pyproject.toml, an optional test file, and an optional README.
+- For dependencies, use pip package names with version specifiers (e.g. "click>=8.1.0", "pytest>=8.0").
+- Use "python3 -c 'import module'" or "python3 -m pytest" for verify commands, not node/npm.
+- The builder can generate up to ~21000 tokens per task — a single file up to ~600 lines is fine.
+- If tests are needed, combine ALL tests into a single test file. Max 1 test file.`);
+    } else {
+      lines.push(`
 IMPORTANT — Python project constraints:
 - Generate 4 to 6 tasks. Python's import chain means tasks cannot be as granular as Node.js, but avoid putting the entire implementation in a single massive task.
 - Split the implementation across 2-4 "implement" tasks, each producing 1-2 files. Each file MUST be under 150 lines. If a module would be longer, split it into separate files.
@@ -82,6 +96,7 @@ IMPORTANT — Python project constraints:
 - Combine all tests into a single "test" task with AT MOST 2 test files. Keep test files concise — test the most critical paths only.
 - NEVER put everything into a single monolithic file. Split into multiple focused modules.
 - The builder can only generate ~16000 tokens per task. Keep each task's total file content under 400 lines. If a test task has too many files, reduce to 1-2 test files covering the critical logic.`);
+    }
   }
 
   return lines.join("\n");

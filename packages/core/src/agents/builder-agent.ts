@@ -109,7 +109,14 @@ Tests must NEVER make real network requests or run real subprocesses.
 CRITICAL: This is a Python project. Do NOT use npm, node, npx, vitest, jest, or any Node.js tools.
 Use pip for package installation, python3 for execution, and python3 -m pytest for testing.
 
-Common dependencies may be pre-installed in the sandbox (pytest, pytest-cov). Do not reinstall them.`;
+Common dependencies may be pre-installed in the sandbox (pytest, pytest-cov). Do not reinstall them.
+
+LEARNED RULES (from prior adversarial review — follow strictly):
+- Always use CONSISTENT function names across all modules. If a function is called check_docker_security in the main module, use the exact same name everywhere (imports, tests, CLI). Never have check_docker_compose in one file and check_docker_security in another.
+- Always handle missing users/directories gracefully with try/except. Never assume /etc/crontab or /etc/ssh/sshd_config exists.
+- Always propagate exit codes correctly: sys.exit(main()) in __main__.py. Return non-zero exit code if any CRITICAL (exit 2) or HIGH (exit 1) findings exist.
+- For security audit tools: always check docker-compose.yml AND docker-compose.yaml. Also detect services with no "user" field (defaults to root — flag as HIGH).
+- Keep test files SHORT — max 200 lines per test file. Test only the public API, not internal helpers. Use parametrize for similar test cases.`;
 
 /**
  * Select the appropriate system prompt based on project runtime.
@@ -174,6 +181,12 @@ interface BuilderState {
   errors: string[];
 }
 
+/** Max output tokens by runtime. Python files embedded in JSON need more space. */
+const MAX_TOKENS_NODE = 16384;
+// 21000 is the practical ceiling without SDK streaming (~30% more than Node).
+// SDK throws "streaming required" above ~21333 tokens.
+const MAX_TOKENS_PYTHON = 21000;
+
 /**
  * One Anthropic call for a single task; updates counters and breaker.
  */
@@ -183,13 +196,14 @@ async function callModelForTask(
   state: BuilderState,
   systemMessage: string,
   userMessage: string,
+  maxTokens: number = MAX_TOKENS_NODE,
 ): Promise<TaskCodeGen> {
   if (state.apiCalls >= MAX_API_CALLS) {
     throw new BuilderAgentError(`Exceeded MAX_API_CALLS (${MAX_API_CALLS})`);
   }
   const resp = await client.messages.create({
     model: MODEL,
-    max_tokens: 16384,
+    max_tokens: maxTokens,
     system: systemMessage,
     messages: [{ role: "user", content: userMessage }],
   });
@@ -214,7 +228,7 @@ async function callModelForTask(
     }
     const retryResp = await client.messages.create({
       model: MODEL,
-      max_tokens: 16384,
+      max_tokens: maxTokens,
       system: systemMessage,
       messages: [
         { role: "user" as const, content: userMessage },
@@ -249,6 +263,7 @@ function buildTaskPrompt(
   failure: { stderr: string; stdout: string } | undefined,
   rejection: ContrarianRejection | undefined,
   existingFiles: Map<string, string>,
+  python?: boolean,
 ): string {
   const lines = [
     `Title: ${spec.title}`,
@@ -284,10 +299,11 @@ function buildTaskPrompt(
     lines.push(
       `\nFiles already written by earlier tasks in this build (you MUST stay consistent with their contents — do not redefine exports, change interfaces, or break tests they contain):`,
     );
-    // Cap each file at 4000 chars to keep the prompt bounded; cap total context.
-    let budget = 24000;
+    // Cap each file at 4000 chars (6000 for Python) to keep the prompt bounded; cap total context.
+    const perFileCap = python ? 6000 : 4000;
+    let budget = python ? 48000 : 24000;
     for (const [path, content] of existingFiles) {
-      const slice = content.length > 4000 ? content.slice(0, 4000) + "\n…(truncated)" : content;
+      const slice = content.length > perFileCap ? content.slice(0, perFileCap) + "\n…(truncated)" : content;
       const block = `\n--- ${path} ---\n${slice}`;
       if (block.length > budget) {
         lines.push(`\n--- ${path} --- (omitted, ${content.length} chars)`);
@@ -301,6 +317,123 @@ function buildTaskPrompt(
 }
 
 /**
+ * For Python projects, verify that all local imports in generated files
+ * resolve against files already written. If a `from X import Y` references
+ * a name that doesn't exist in module X, rewrite the import to use the
+ * correct name found in that module's source.
+ *
+ * Mutates codegen.files in-place.
+ */
+function fixPythonImports(codegen: TaskCodeGen, collected: Map<string, string>): string[] {
+  const fixes: string[] = [];
+
+  // Build a map of module path → set of top-level names (def/class/variable assignments)
+  const moduleExports = new Map<string, Set<string>>();
+  for (const [path, content] of collected) {
+    if (!path.endsWith(".py")) continue;
+    const names = new Set<string>();
+    for (const line of content.split("\n")) {
+      // Match: def func_name(, class ClassName(, VARIABLE =
+      const defMatch = line.match(/^(?:def|async\s+def)\s+([a-zA-Z_]\w*)\s*\(/);
+      if (defMatch) { names.add(defMatch[1]); continue; }
+      const classMatch = line.match(/^class\s+([a-zA-Z_]\w*)\s*[:(]/);
+      if (classMatch) { names.add(classMatch[1]); continue; }
+      const varMatch = line.match(/^([A-Z_][A-Z0-9_]*)\s*=/);
+      if (varMatch) { names.add(varMatch[1]); continue; }
+      // Also catch regular variable assignments at top level (no indent)
+      const assignMatch = line.match(/^([a-zA-Z_]\w*)\s*(?::\s*\w+\s*)?=/);
+      if (assignMatch && !line.startsWith(" ") && !line.startsWith("\t")) {
+        names.add(assignMatch[1]);
+      }
+    }
+    moduleExports.set(path, names);
+  }
+
+  // Also index files from this codegen (they may import each other)
+  for (const f of codegen.files) {
+    if (!f.path.endsWith(".py")) continue;
+    if (moduleExports.has(f.path)) continue;
+    const names = new Set<string>();
+    for (const line of f.content.split("\n")) {
+      const defMatch = line.match(/^(?:def|async\s+def)\s+([a-zA-Z_]\w*)\s*\(/);
+      if (defMatch) { names.add(defMatch[1]); continue; }
+      const classMatch = line.match(/^class\s+([a-zA-Z_]\w*)\s*[:(]/);
+      if (classMatch) { names.add(classMatch[1]); continue; }
+      const varMatch = line.match(/^([A-Z_][A-Z0-9_]*)\s*=/);
+      if (varMatch) { names.add(varMatch[1]); }
+    }
+    moduleExports.set(f.path, names);
+  }
+
+  // Convert module dotted paths to file paths: "audit_lib.models" → "audit_lib/models.py"
+  function moduleToPath(mod: string): string | undefined {
+    const asPath = mod.replace(/\./g, "/") + ".py";
+    if (moduleExports.has(asPath)) return asPath;
+    // Try __init__.py
+    const initPath = mod.replace(/\./g, "/") + "/__init__.py";
+    if (moduleExports.has(initPath)) return initPath;
+    return undefined;
+  }
+
+  for (const f of codegen.files) {
+    if (!f.path.endsWith(".py")) continue;
+    const lines = f.content.split("\n");
+    let changed = false;
+
+    for (let i = 0; i < lines.length; i++) {
+      // Match: from module.path import name1, name2, ...
+      const importMatch = lines[i].match(/^from\s+([\w.]+)\s+import\s+(.+)$/);
+      if (!importMatch) continue;
+
+      const modPath = moduleToPath(importMatch[1]);
+      if (!modPath) continue; // stdlib or external — skip
+
+      const exports = moduleExports.get(modPath);
+      if (!exports || exports.size === 0) continue;
+
+      const importedNames = importMatch[2].split(",").map((n) => n.trim().split(/\s+as\s+/)[0].trim());
+      const fixedNames: string[] = [];
+
+      for (const name of importedNames) {
+        if (exports.has(name)) {
+          fixedNames.push(name);
+          continue;
+        }
+        // Name doesn't exist — find closest match
+        const lower = name.toLowerCase();
+        let bestMatch: string | null = null;
+        for (const exp of exports) {
+          if (exp.toLowerCase() === lower) { bestMatch = exp; break; }
+          // Fuzzy: if the export contains the import name or vice versa
+          if (exp.toLowerCase().includes(lower) || lower.includes(exp.toLowerCase())) {
+            bestMatch = exp;
+          }
+        }
+        if (bestMatch) {
+          fixes.push(`import fix: ${f.path}: ${name} → ${bestMatch} (from ${modPath})`);
+          fixedNames.push(bestMatch);
+          changed = true;
+        } else {
+          // Can't find a match — keep original, will fail at verify and self-fix
+          fixes.push(`import warning: ${f.path}: ${name} not found in ${modPath} (exports: ${[...exports].join(", ")})`);
+          fixedNames.push(name);
+        }
+      }
+
+      if (changed) {
+        lines[i] = `from ${importMatch[1]} import ${fixedNames.join(", ")}`;
+      }
+    }
+
+    if (changed) {
+      f.content = lines.join("\n");
+    }
+  }
+
+  return fixes;
+}
+
+/**
  * Apply a code-gen result inside the sandbox and run its verify command.
  */
 async function applyAndVerify(
@@ -311,6 +444,14 @@ async function applyAndVerify(
   taskType?: string,
   python?: boolean,
 ): Promise<{ ok: boolean; stdout: string; stderr: string }> {
+  // For Python projects, verify and fix imports before writing files
+  if (python) {
+    const importFixes = fixPythonImports(codegen, collected);
+    for (const fix of importFixes) {
+      console.log(`[builder] ${fix}`);
+    }
+  }
+
   for (const f of codegen.files) {
     await sandbox.writeFile(sandboxId, f.path, f.content);
     collected.set(f.path, f.content);
@@ -431,7 +572,8 @@ export async function runBuilderAgent(
             breaker,
             state,
             systemPrompt,
-            buildTaskPrompt(input.spec, input.plan, task, lastFailure, input.rejection, collected),
+            buildTaskPrompt(input.spec, input.plan, task, lastFailure, input.rejection, collected, python),
+            python ? MAX_TOKENS_PYTHON : MAX_TOKENS_NODE,
           );
           const result = await applyAndVerify(sandbox, sandboxId, codegen, collected, task.type, python);
           testResults.push({
